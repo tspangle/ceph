@@ -109,11 +109,12 @@ struct CapSnap {
 };
 
 // inode flags
-#define I_COMPLETE	1
-#define I_DIR_ORDERED	2
-#define I_CAP_DROPPED	4
-#define I_SNAPDIR_OPEN	8
-#define I_KICK_FLUSH	16
+#define I_COMPLETE		(1 << 0)
+#define I_DIR_ORDERED		(1 << 1)
+#define I_SNAPDIR_OPEN		(1 << 2)
+#define I_KICK_FLUSH		(1 << 3)
+#define I_CAP_DROPPED		(1 << 4)
+#define I_ERROR_FILELOCK	(1 << 5)
 
 struct Inode {
   Client *client;
@@ -192,7 +193,6 @@ struct Inode {
   // about the dir (if this is one!)
   Dir       *dir;     // if i'm a dir.
   fragtree_t dirfragtree;
-  set<int>  dir_contacts;
   uint64_t dir_release_count, dir_ordered_count;
   bool dir_hashed, dir_replicated;
 
@@ -228,9 +228,9 @@ struct Inode {
   map<string,bufferptr> xattrs;
   map<frag_t,int> fragmap;  // known frag -> mds mappings
 
-  list<Cond*>       waitfor_caps;
-  list<Cond*>       waitfor_commit;
-  list<Cond*>	    waitfor_deleg;
+  std::list<ceph::condition_variable*> waitfor_caps;
+  std::list<ceph::condition_variable*> waitfor_commit;
+  std::list<ceph::condition_variable*> waitfor_deleg;
 
   Dentry *get_first_parent() {
     ceph_assert(!dentries.empty());
@@ -258,6 +258,12 @@ struct Inode {
   // file locks
   std::unique_ptr<ceph_lock_state_t> fcntl_locks;
   std::unique_ptr<ceph_lock_state_t> flock_locks;
+
+  bool has_any_filelocks() {
+    return
+      (fcntl_locks && !fcntl_locks->empty()) ||
+      (flock_locks && !flock_locks->empty());
+  }
 
   list<Delegation> delegations;
 

@@ -7,6 +7,7 @@ set(rbd_srcs
   IndentStream.cc
   MirrorDaemonServiceInfo.cc
   OptionPrinter.cc
+  Schedule.cc
   Shell.cc
   Utils.cc
   action/Bench.cc
@@ -32,8 +33,9 @@ set(rbd_srcs
   action/Lock.cc
   action/MergeDiff.cc
   action/Migration.cc
-  action/MirrorPool.cc
   action/MirrorImage.cc
+  action/MirrorPool.cc
+  action/MirrorSnapshotSchedule.cc
   action/Namespace.cc
   action/Nbd.cc
   action/ObjectMap.cc
@@ -45,16 +47,20 @@ set(rbd_srcs
   action/Snap.cc
   action/Sparsify.cc
   action/Status.cc
+  action/TrashPurgeSchedule.cc
   action/Trash.cc
   action/Watch.cc)
 
 add_executable(rbd ${rbd_srcs}
   $<TARGET_OBJECTS:common_texttable_obj>)
 set_target_properties(rbd PROPERTIES OUTPUT_NAME rbd)
-target_link_libraries(rbd librbd librados
-  cls_journal_client cls_rbd_client
+target_link_libraries(rbd librbd
+  cls_journal_client
+  cls_rbd_client
   rbd_types
   journal
+  libneorados
+  librados
   ceph-common global ${CURSES_LIBRARIES}
   ${BLKID_LIBRARIES} ${CMAKE_DL_LIBS})
 if(WITH_KRBD)

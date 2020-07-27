@@ -1,12 +1,13 @@
 """
 Deploy and configure Tempest for Teuthology
 """
+import configparser
 import contextlib
 import logging
 
 from teuthology import misc as teuthology
 from teuthology import contextutil
-from teuthology.config import config as teuth_config
+from teuthology.exceptions import ConfigError
 from teuthology.orchestra import run
 
 log = logging.getLogger(__name__)
@@ -90,8 +91,12 @@ def setup_logging(ctx, cpar):
 
 def to_config(config, params, section, cpar):
     for (k, v) in config[section].items():
-        if (isinstance(v, str)):
+        if isinstance(v, str):
             v = v.format(**params)
+        elif isinstance(v, bool):
+            v = 'true' if v else 'false'
+        else:
+            v = str(v)
         cpar.set(section, k, v)
 
 @contextlib.contextmanager
@@ -99,7 +104,6 @@ def configure_instance(ctx, config):
     assert isinstance(config, dict)
     log.info('Configuring Tempest')
 
-    import ConfigParser
     for (client, cconfig) in config.items():
         run_in_tempest_venv(ctx, client,
             [
@@ -126,14 +130,14 @@ def configure_instance(ctx, config):
             'keystone_public_port': str(public_port),
         }
 
-        cpar = ConfigParser.ConfigParser()
+        cpar = configparser.ConfigParser()
         cpar.read(local_conf)
         setup_logging(ctx, cpar)
         to_config(cconfig, params, 'auth', cpar)
         to_config(cconfig, params, 'identity', cpar)
         to_config(cconfig, params, 'object-storage', cpar)
         to_config(cconfig, params, 'object-storage-feature-enabled', cpar)
-        cpar.write(file(local_conf, 'w+'))
+        cpar.write(open(local_conf, 'w+'))
 
         remote.put_file(local_conf, tetcdir + '/tempest.conf')
     yield
@@ -154,10 +158,8 @@ def run_tempest(ctx, config):
                 get_tempest_dir(ctx) + '/workspace.yaml',
                 '--workspace',
                 'rgw',
-                '--regex',
-                    '(tempest.api.object_storage)' +
-                    ''.join([ '(?!{blackitem})'.format(blackitem=blackitem)
-                        for blackitem in blacklist])
+                '--regex', '^tempest.api.object_storage',
+                '--black-regex', '|'.join(blacklist)
             ])
     try:
         yield
@@ -176,13 +178,17 @@ def task(ctx, config):
         ceph:
           conf:
             client:
-              rgw keystone admin token: ADMIN
+              rgw keystone api version: 3
               rgw keystone accepted roles: admin,Member
               rgw keystone implicit tenants: true
               rgw keystone accepted admin roles: admin
               rgw swift enforce content length: true
               rgw swift account in url: true
               rgw swift versioning enabled: true
+              rgw keystone admin domain: Default
+              rgw keystone admin user: admin
+              rgw keystone admin password: ADMIN
+              rgw keystone admin project: admin
       tasks:
       # typically, the task should be preceded with install, ceph, tox,
       # keystone and rgw. Tox and Keystone are specific requirements
@@ -238,11 +244,10 @@ def task(ctx, config):
         config = all_clients
     if isinstance(config, list):
         config = dict.fromkeys(config)
-    clients = config.keys()
 
     overrides = ctx.config.get('overrides', {})
     # merge each client section, not the top level.
-    for client in config.iterkeys():
+    for client in config.keys():
         if not config[client]:
             config[client] = {}
         teuthology.deep_merge(config[client], overrides.get('keystone', {}))

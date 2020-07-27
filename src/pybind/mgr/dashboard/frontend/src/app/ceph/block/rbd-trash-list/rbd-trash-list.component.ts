@@ -1,9 +1,8 @@
 import { Component, OnInit, TemplateRef, ViewChild } from '@angular/core';
 
-import { I18n } from '@ngx-translate/i18n-polyfill';
+import { NgbModalRef } from '@ng-bootstrap/ng-bootstrap';
 import * as _ from 'lodash';
 import * as moment from 'moment';
-import { BsModalRef, BsModalService } from 'ngx-bootstrap/modal';
 
 import { RbdService } from '../../../shared/api/rbd.service';
 import { CriticalConfirmationModalComponent } from '../../../shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
@@ -17,9 +16,12 @@ import { CdTableColumn } from '../../../shared/models/cd-table-column';
 import { CdTableSelection } from '../../../shared/models/cd-table-selection';
 import { ExecutingTask } from '../../../shared/models/executing-task';
 import { FinishedTask } from '../../../shared/models/finished-task';
+import { ImageSpec } from '../../../shared/models/image-spec';
 import { Permission } from '../../../shared/models/permissions';
+import { Task } from '../../../shared/models/task';
 import { CdDatePipe } from '../../../shared/pipes/cd-date.pipe';
 import { AuthStorageService } from '../../../shared/services/auth-storage.service';
+import { ModalService } from '../../../shared/services/modal.service';
 import { TaskListService } from '../../../shared/services/task-list.service';
 import { TaskWrapperService } from '../../../shared/services/task-wrapper.service';
 import { RbdTrashPurgeModalComponent } from '../rbd-trash-purge-modal/rbd-trash-purge-modal.component';
@@ -32,11 +34,11 @@ import { RbdTrashRestoreModalComponent } from '../rbd-trash-restore-modal/rbd-tr
   providers: [TaskListService]
 })
 export class RbdTrashListComponent implements OnInit {
-  @ViewChild(TableComponent)
+  @ViewChild(TableComponent, { static: true })
   table: TableComponent;
-  @ViewChild('expiresTpl')
+  @ViewChild('expiresTpl', { static: true })
   expiresTpl: TemplateRef<any>;
-  @ViewChild('deleteTpl')
+  @ViewChild('deleteTpl', { static: true })
   deleteTpl: TemplateRef<any>;
 
   icons = Icons;
@@ -44,21 +46,21 @@ export class RbdTrashListComponent implements OnInit {
   columns: CdTableColumn[];
   executingTasks: ExecutingTask[] = [];
   images: any;
-  modalRef: BsModalRef;
+  modalRef: NgbModalRef;
   permission: Permission;
   retries: number;
   selection = new CdTableSelection();
   tableActions: CdTableAction[];
   viewCacheStatusList: any[];
+  disablePurgeBtn = true;
 
   constructor(
     private authStorageService: AuthStorageService,
     private rbdService: RbdService,
-    private modalService: BsModalService,
+    private modalService: ModalService,
     private cdDatePipe: CdDatePipe,
     private taskListService: TaskListService,
     private taskWrapper: TaskWrapperService,
-    private i18n: I18n,
     public actionLabels: ActionLabelsI18n
   ) {
     this.permission = this.authStorageService.getPermissions().rbdImage;
@@ -80,58 +82,73 @@ export class RbdTrashListComponent implements OnInit {
   ngOnInit() {
     this.columns = [
       {
-        name: this.i18n('ID'),
+        name: $localize`ID`,
         prop: 'id',
         flexGrow: 1,
         cellTransformation: CellTemplate.executing
       },
       {
-        name: this.i18n('Name'),
+        name: $localize`Name`,
         prop: 'name',
         flexGrow: 1
       },
       {
-        name: this.i18n('Pool'),
+        name: $localize`Pool`,
         prop: 'pool_name',
         flexGrow: 1
       },
       {
-        name: this.i18n('Status'),
+        name: $localize`Namespace`,
+        prop: 'namespace',
+        flexGrow: 1
+      },
+      {
+        name: $localize`Status`,
         prop: 'deferment_end_time',
         flexGrow: 1,
         cellTemplate: this.expiresTpl
       },
       {
-        name: this.i18n('Deleted At'),
+        name: $localize`Deleted At`,
         prop: 'deletion_time',
         flexGrow: 1,
         pipe: this.cdDatePipe
       }
     ];
 
+    const itemFilter = (entry: any, task: Task) => {
+      const imageSpec = new ImageSpec(entry.pool_name, entry.namespace, entry.id);
+      return imageSpec.toString() === task.metadata['image_id_spec'];
+    };
+
+    const taskFilter = (task: Task) => {
+      return ['rbd/trash/remove', 'rbd/trash/restore'].includes(task.name);
+    };
+
     this.taskListService.init(
       () => this.rbdService.listTrash(),
       (resp) => this.prepareResponse(resp),
       (images) => (this.images = images),
       () => this.onFetchError(),
-      this.taskFilter,
-      this.itemFilter,
+      taskFilter,
+      itemFilter,
       undefined
     );
   }
 
   prepareResponse(resp: any[]): any[] {
-    let images = [];
+    let images: any[] = [];
     const viewCacheStatusMap = {};
-    resp.forEach((pool) => {
+    resp.forEach((pool: Record<string, any>) => {
       if (_.isUndefined(viewCacheStatusMap[pool.status])) {
         viewCacheStatusMap[pool.status] = [];
       }
       viewCacheStatusMap[pool.status].push(pool.pool_name);
       images = images.concat(pool.value);
+      this.disablePurgeBtn = !images.length;
     });
 
-    const viewCacheStatusList = [];
+    const viewCacheStatusList: any[] = [];
     _.forEach(viewCacheStatusMap, (value: any, key) => {
       viewCacheStatusList.push({
         status: parseInt(key, 10),
@@ -154,54 +171,44 @@ export class RbdTrashListComponent implements OnInit {
     this.viewCacheStatusList = [{ status: ViewCacheStatus.ValueException }];
   }
 
-  itemFilter(entry, task) {
-    return entry.id === task.metadata['image_id'];
-  }
-
-  taskFilter(task) {
-    return ['rbd/trash/remove', 'rbd/trash/restore'].includes(task.name);
-  }
-
   updateSelection(selection: CdTableSelection) {
     this.selection = selection;
   }
 
   restoreModal() {
     const initialState = {
-      metaType: 'RBD',
       poolName: this.selection.first().pool_name,
+      namespace: this.selection.first().namespace,
       imageName: this.selection.first().name,
       imageId: this.selection.first().id
     };
 
-    this.modalRef = this.modalService.show(RbdTrashRestoreModalComponent, { initialState });
+    this.modalRef = this.modalService.show(RbdTrashRestoreModalComponent, initialState);
   }
 
   deleteModal() {
     const poolName = this.selection.first().pool_name;
-    const imageName = this.selection.first().name;
+    const namespace = this.selection.first().namespace;
     const imageId = this.selection.first().id;
     const expiresAt = this.selection.first().deferment_end_time;
+    const imageIdSpec = new ImageSpec(poolName, namespace, imageId);
 
     this.modalRef = this.modalService.show(CriticalConfirmationModalComponent, {
-      initialState: {
-        itemDescription: 'RBD',
-        bodyTemplate: this.deleteTpl,
-        bodyContext: { $implicit: expiresAt },
-        submitActionObservable: () =>
-          this.taskWrapper.wrapTaskAroundCall({
-            task: new FinishedTask('rbd/trash/remove', {
-              pool_name: poolName,
-              image_id: imageId,
-              image_name: imageName
-            }),
-            call: this.rbdService.removeTrash(poolName, imageId, imageName, true)
-          })
-      }
+      itemDescription: 'RBD',
+      itemNames: [imageIdSpec],
+      bodyTemplate: this.deleteTpl,
+      bodyContext: { $implicit: expiresAt },
+      submitActionObservable: () =>
+        this.taskWrapper.wrapTaskAroundCall({
+          task: new FinishedTask('rbd/trash/remove', {
+            image_id_spec: imageIdSpec.toString()
+          }),
+          call: this.rbdService.removeTrash(imageIdSpec, true)
+        })
     });
   }
 
-  isExpired(expiresAt): boolean {
+  isExpired(expiresAt: string): boolean {
     return moment().isAfter(expiresAt);
   }
 

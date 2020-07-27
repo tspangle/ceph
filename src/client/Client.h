@@ -18,11 +18,12 @@
 
 #include "common/CommandTable.h"
 #include "common/Finisher.h"
-#include "common/Mutex.h"
 #include "common/Timer.h"
+#include "common/ceph_mutex.h"
 #include "common/cmdparse.h"
 #include "common/compiler_extensions.h"
-#include "include/cephfs/ceph_statx.h"
+#include "include/common_fwd.h"
+#include "include/cephfs/ceph_ll_client.h"
 #include "include/filepath.h"
 #include "include/interval_set.h"
 #include "include/lru.h"
@@ -53,7 +54,6 @@ class FSMap;
 class FSMapUser;
 class MonClient;
 
-class CephContext;
 
 struct DirStat;
 struct LeaseStat;
@@ -63,7 +63,6 @@ class Filer;
 class Objecter;
 class WritebackHandler;
 
-class PerfCounters;
 class MDSMap;
 class Message;
 
@@ -121,28 +120,6 @@ struct CapSnap;
 
 struct MetaRequest;
 class ceph_lock_state_t;
-
-
-typedef void (*client_ino_callback_t)(void *handle, vinodeno_t ino, int64_t off, int64_t len);
-
-typedef void (*client_dentry_callback_t)(void *handle, vinodeno_t dirino,
-					 vinodeno_t ino, string& name);
-typedef int (*client_remount_callback_t)(void *handle);
-
-typedef void(*client_switch_interrupt_callback_t)(void *handle, void *data);
-typedef mode_t (*client_umask_callback_t)(void *handle);
-
-/* Callback for delegation recalls */
-typedef void (*ceph_deleg_cb_t)(Fh *fh, void *priv);
-
-struct client_callback_args {
-  void *handle;
-  client_ino_callback_t ino_cb;
-  client_dentry_callback_t dentry_cb;
-  client_switch_interrupt_callback_t switch_intr_cb;
-  client_remount_callback_t remount_cb;
-  client_umask_callback_t umask_cb;
-};
 
 // ========================================================
 // client interface
@@ -255,6 +232,7 @@ public:
   friend class C_Client_Remount;
   friend class C_Client_RequestInterrupt;
   friend class C_Deleg_Timeout; // Asserts on client_lock, called when a delegation is unreturned
+  friend class C_Client_CacheRelease; // Asserts on client_lock
   friend class SyntheticClient;
   friend void intrusive_ptr_release(Inode *in);
 
@@ -265,8 +243,10 @@ public:
   class CommandHook : public AdminSocketHook {
   public:
     explicit CommandHook(Client *client);
-    bool call(std::string_view command, const cmdmap_t& cmdmap,
-              std::string_view format, bufferlist& out) override;
+    int call(std::string_view command, const cmdmap_t& cmdmap,
+	     Formatter *f,
+	     std::ostream& errss,
+	     bufferlist& out) override;
   private:
     Client *m_client;
   };
@@ -454,7 +434,7 @@ public:
 
   // hpc lazyio
   int lazyio(int fd, int enable);
-  int lazyio_propogate(int fd, loff_t offset, size_t count);
+  int lazyio_propagate(int fd, loff_t offset, size_t count);
   int lazyio_synchronize(int fd, loff_t offset, size_t count);
 
   // expose file layout
@@ -600,7 +580,7 @@ public:
   int ll_osdaddr(int osd, uint32_t *addr);
   int ll_osdaddr(int osd, char* buf, size_t size);
 
-  void ll_register_callbacks(struct client_callback_args *args);
+  void ll_register_callbacks(struct ceph_client_callback_args *args);
   int test_dentry_handling(bool can_invalidate);
 
   const char** get_tracked_conf_keys() const override;
@@ -611,8 +591,8 @@ public:
   int ll_delegation(Fh *fh, unsigned cmd, ceph_deleg_cb_t cb, void *priv);
 
   entity_name_t get_myname() { return messenger->get_myname(); }
-  void wait_on_list(list<Cond*>& ls);
-  void signal_cond_list(list<Cond*>& ls);
+  void wait_on_list(std::list<ceph::condition_variable*>& ls);
+  void signal_cond_list(std::list<ceph::condition_variable*>& ls);
 
   void set_filer_flags(int flags);
   void clear_filer_flags(int flags);
@@ -647,14 +627,14 @@ public:
 		      inodeno_t realm, int flags, const UserPerm& perms);
   void remove_cap(Cap *cap, bool queue_release);
   void remove_all_caps(Inode *in);
-  void remove_session_caps(MetaSession *session);
+  void remove_session_caps(MetaSession *session, int err);
   int mark_caps_flushing(Inode *in, ceph_tid_t *ptid);
   void adjust_session_flushing_caps(Inode *in, MetaSession *old_s, MetaSession *new_s);
   void flush_caps_sync();
   void kick_flushing_caps(Inode *in, MetaSession *session);
   void kick_flushing_caps(MetaSession *session);
   void early_kick_flushing_caps(MetaSession *session);
-  int get_caps(Inode *in, int need, int want, int *have, loff_t endoff);
+  int get_caps(Fh *fh, int need, int want, int *have, loff_t endoff);
   int get_caps_used(Inode *in);
 
   void maybe_update_snaprealm(SnapRealm *realm, snapid_t snap_created, snapid_t snap_highwater,
@@ -694,6 +674,10 @@ public:
   void _invalidate_inode_cache(Inode *in);
   void _invalidate_inode_cache(Inode *in, int64_t off, int64_t len);
   void _async_invalidate(vinodeno_t ino, int64_t off, int64_t len);
+
+  void _schedule_ino_release_callback(Inode *in);
+  void _async_inode_release(vinodeno_t ino);
+
   bool _release(Inode *in);
 
   /**
@@ -755,6 +739,7 @@ public:
   std::unique_ptr<PerfCounters> logger;
   std::unique_ptr<MDSMap> mdsmap;
 
+  bool fuse_default_permissions;
 
 protected:
   /* Flags for check_caps() */
@@ -781,7 +766,7 @@ protected:
   MetaSession *_get_or_open_mds_session(mds_rank_t mds);
   MetaSession *_open_mds_session(mds_rank_t mds);
   void _close_mds_session(MetaSession *s);
-  void _closed_mds_session(MetaSession *s);
+  void _closed_mds_session(MetaSession *s, int err=0, bool rejected=false);
   bool _any_stale_sessions() const;
   void _kick_stale_sessions();
   void handle_client_session(const MConstRef<MClientSession>& m);
@@ -800,7 +785,8 @@ protected:
   void put_request(MetaRequest *request);
   void unregister_request(MetaRequest *request);
 
-  int verify_reply_trace(int r, MetaRequest *request, const MConstRef<MClientReply>& reply,
+  int verify_reply_trace(int r, MetaSession *session, MetaRequest *request,
+			 const MConstRef<MClientReply>& reply,
 			 InodeRef *ptarget, bool *pcreated,
 			 const UserPerm& perms);
   void encode_cap_releases(MetaRequest *request, mds_rank_t mds);
@@ -950,6 +936,8 @@ protected:
 
   void _close_sessions();
 
+  void _pre_init();
+
   /**
    * The basic housekeeping parts of init (perf counters, admin socket)
    * that is independent of how objecters/monclient/messengers are
@@ -959,7 +947,7 @@ protected:
 
   // global client lock
   //  - protects Client and buffer cache both!
-  Mutex                  client_lock;
+  ceph::mutex client_lock = ceph::make_mutex("Client::client_lock");
 
   std::map<snapid_t, int> ll_snap_ref;
 
@@ -1200,6 +1188,7 @@ private:
   client_ino_callback_t ino_invalidate_cb = nullptr;
   client_dentry_callback_t dentry_invalidate_cb = nullptr;
   client_umask_callback_t umask_cb = nullptr;
+  client_ino_release_t ino_release_cb = nullptr;
   void *callback_handle = nullptr;
   bool can_invalidate_dentries = false;
 
@@ -1207,6 +1196,7 @@ private:
   Finisher async_dentry_invalidator;
   Finisher interrupt_finisher;
   Finisher remount_finisher;
+  Finisher async_ino_releasor;
   Finisher objecter_finisher;
 
   Context *tick_event = nullptr;
@@ -1221,10 +1211,11 @@ private:
 
   // mds sessions
   map<mds_rank_t, MetaSession> mds_sessions;  // mds -> push seq
-  list<Cond*> waiting_for_mdsmap;
+  std::set<mds_rank_t> mds_ranks_closing;  // mds ranks currently tearing down sessions
+  std::list<ceph::condition_variable*> waiting_for_mdsmap;
 
   // FSMap, for when using mds_command
-  list<Cond*> waiting_for_fsmap;
+  std::list<ceph::condition_variable*> waiting_for_fsmap;
   std::unique_ptr<FSMap> fsmap;
   std::unique_ptr<FSMapUser> fsmap_user;
 
@@ -1241,6 +1232,7 @@ private:
   ceph::unordered_map<int, Fh*> fd_map;
   set<Fh*> ll_unclosed_fh_set;
   ceph::unordered_set<dir_result_t*> opened_dirs;
+  uint64_t fd_gen = 1;
 
   bool   initialized = false;
   bool   mounted = false;
@@ -1252,12 +1244,6 @@ private:
   interval_set<ino_t> free_faked_inos;
   ino_t last_used_faked_ino;
   ino_t last_used_faked_root;
-
-  // When an MDS has sent us a REJECT, remember that and don't
-  // contact it again.  Remember which inst rejected us, so that
-  // when we talk to another inst with the same rank we can
-  // try again.
-  std::map<mds_rank_t, entity_addrvec_t> rejected_by_mds;
 
   int local_osd = -ENXIO;
   epoch_t local_osd_epoch = 0;
@@ -1278,18 +1264,20 @@ private:
   ceph::unordered_map<inodeno_t,SnapRealm*> snap_realms;
   std::map<std::string, std::string> metadata;
 
+  utime_t last_auto_reconnect;
+
   // trace generation
   ofstream traceout;
 
-  Cond mount_cond, sync_cond;
+  ceph::condition_variable mount_cond, sync_cond;
 
   std::map<std::pair<int64_t,std::string>, int> pool_perms;
-  list<Cond*> waiting_for_pool_perm;
+  std::list<ceph::condition_variable*> waiting_for_pool_perm;
 
   uint64_t retries_on_invalidate = 0;
 
   // state reclaim
-  list<Cond*> waiting_for_reclaim;
+  std::list<ceph::condition_variable*> waiting_for_reclaim;
   int reclaim_errno = 0;
   epoch_t reclaim_osd_epoch = 0;
   entity_addrvec_t reclaim_target_addrs;
@@ -1302,7 +1290,7 @@ private:
 class StandaloneClient : public Client
 {
 public:
-  StandaloneClient(Messenger *m, MonClient *mc);
+  StandaloneClient(Messenger *m, MonClient *mc, boost::asio::io_context& ictx);
 
   ~StandaloneClient() override;
 

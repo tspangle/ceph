@@ -204,9 +204,9 @@ bool Beacon::_send()
       want_state,
       last_seq,
       CEPH_FEATURES_SUPPORTED_DEFAULT);
-
   beacon->set_health(health);
   beacon->set_compat(compat);
+  beacon->set_fs(g_conf().get_val<std::string>("mds_join_fs"));
   // piggyback the sys info on beacon msg
   if (want_state == MDSMap::STATE_BOOT) {
     map<string, string> sys_info;
@@ -258,7 +258,7 @@ bool Beacon::is_laggy()
   return false;
 }
 
-void Beacon::set_want_state(const MDSMap &mdsmap, MDSMap::DaemonState const newstate)
+void Beacon::set_want_state(const MDSMap &mdsmap, MDSMap::DaemonState newstate)
 {
   std::unique_lock lock(mutex);
 
@@ -292,7 +292,7 @@ void Beacon::notify_health(MDSRank const *mds)
   }
 
   // I'm going to touch this MDS, so it must be locked
-  ceph_assert(mds->mds_lock.is_locked_by_me());
+  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
 
   health.metrics.clear();
 
@@ -304,9 +304,9 @@ void Beacon::notify_health(MDSRank const *mds)
   }
 
   // Detect MDS_HEALTH_TRIM condition
-  // Arbitrary factor of 2, indicates MDS is not trimming promptly
+  // Indicates MDS is not trimming promptly
   {
-    if (mds->mdlog->get_num_segments() > (size_t)(g_conf()->mds_log_max_segments * 2)) {
+    if (mds->mdlog->get_num_segments() > (size_t)(g_conf()->mds_log_max_segments * g_conf().get_val<double>("mds_log_warn_factor"))) {
       std::ostringstream oss;
       oss << "Behind on trimming (" << mds->mdlog->get_num_segments()
         << "/" << g_conf()->mds_log_max_segments << ")";

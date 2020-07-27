@@ -6,6 +6,8 @@ export class CdTableAction {
   // or none if it's not needed
   routerLink?: string | Function;
 
+  preserveFragment? = false;
+
   // This is the function that will be triggered on a click event if defined
   click?: Function;
 
@@ -27,7 +29,7 @@ export class CdTableAction {
    * disabled. The specified message will be shown to the user as a button
    * tooltip.
    */
-  disableDesc?: Function;
+  disableDesc?: (_: CdTableSelection) => string | undefined;
 
   /**
    * Defines if the button can become 'primary' (displayed as button and not

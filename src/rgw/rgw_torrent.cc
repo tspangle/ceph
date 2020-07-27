@@ -1,5 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// vim: ts=8 sw=2 smarttab ft=cpp
 
 #include <errno.h>
 #include <stdlib.h>
@@ -7,6 +7,7 @@
 #include <sstream>
 
 #include "rgw_torrent.h"
+#include "rgw_sal.h"
 #include "include/str_list.h"
 #include "include/rados/librados.hpp"
 
@@ -35,7 +36,7 @@ seed::~seed()
   store = NULL;
 }
 
-void seed::init(struct req_state *p_req, RGWRados *p_store)
+void seed::init(struct req_state *p_req, rgw::sal::RGWRadosStore *p_store)
 {
   s = p_req;
   store = p_store;
@@ -154,6 +155,8 @@ void seed::sha1(SHA1 *h, bufferlist &bl, off_t bl_len)
   /* get sha1 */
   for (off_t i = 0; i < num; i++)
   {
+    // FIPS zeroization audit 20191116: this memset is not intended to
+    // wipe out a secret after use.
     memset(sha, 0x00, sizeof(sha));
     h->Update((unsigned char *)pstr, info.piece_length);
     h->Final((unsigned char *)sha);
@@ -164,11 +167,14 @@ void seed::sha1(SHA1 *h, bufferlist &bl, off_t bl_len)
   /* process remain */
   if (0 != remain)
   {
+    // FIPS zeroization audit 20191116: this memset is not intended to
+    // wipe out a secret after use.
     memset(sha, 0x00, sizeof(sha));
     h->Update((unsigned char *)pstr, remain);
     h->Final((unsigned char *)sha);
     set_info_pieces(sha);
   }
+  ::ceph::crypto::zeroize_for_security(sha, sizeof(sha));
 }
 
 int seed::get_params()
@@ -242,12 +248,12 @@ int seed::save_torrent_file()
 {
   int op_ret = 0;
   string key = RGW_OBJ_TORRENT;
-  rgw_obj obj(s->bucket, s->object.name);    
+  rgw_obj obj(s->bucket->get_bi(), s->object->get_name());
 
   rgw_raw_obj raw_obj;
-  store->obj_to_raw(s->bucket_info.placement_rule, obj, &raw_obj);
+  store->getRados()->obj_to_raw(s->bucket->get_info().placement_rule, obj, &raw_obj);
 
-  auto obj_ctx = store->svc.sysobj->init_obj_ctx();
+  auto obj_ctx = store->svc()->sysobj->init_obj_ctx();
   auto sysobj = obj_ctx.get_obj(raw_obj);
 
   op_ret = sysobj.omap().set(key, bl, null_yield);

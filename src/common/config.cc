@@ -37,11 +37,22 @@
 // set set_mon_vals()
 #define dout_subsys ceph_subsys_monc
 
+using std::cerr;
+using std::cout;
 using std::map;
+using std::less;
 using std::list;
+using std::ostream;
 using std::ostringstream;
 using std::pair;
 using std::string;
+using std::string_view;
+using std::vector;
+
+using ceph::bufferlist;
+using ceph::decode;
+using ceph::encode;
+using ceph::Formatter;
 
 static const char *CEPH_CONF_FILE_DEFAULT = "$data_dir/config, /etc/ceph/$cluster.conf, $home/.ceph/$cluster.conf, $cluster.conf"
 #if defined(__FreeBSD__)
@@ -293,8 +304,8 @@ int md_config_t::set_mon_vals(CephContext *cct,
     std::string err;
     int r = _set_val(values, tracker, i.second, *o, CONF_MON, &err);
     if (r < 0) {
-      lderr(cct) << __func__ << " failed to set " << i.first << " = "
-		 << i.second << ": " << err << dendl;
+      ldout(cct, 4) << __func__ << " failed to set " << i.first << " = "
+		    << i.second << ": " << err << dendl;
       ignored_mon_values.emplace(i);
     } else if (r == ConfigValues::SET_NO_CHANGE ||
 	       r == ConfigValues::SET_NO_EFFECT) {
@@ -318,6 +329,11 @@ int md_config_t::set_mon_vals(CephContext *cct,
 		  << " cleared (was " << Option::to_str(config->second) << ")"
 		  << dendl;
     values.rm_val(name, CONF_MON);
+    // if this is a debug option, it needs to propagate to teh subsys;
+    // this isn't covered by update_legacy_vals() below.  similarly,
+    // we want to trigger a config notification for these items.
+    const Option *o = find_option(name);
+    _refresh(values, *o);
   });
   values_bl.clear();
   update_legacy_vals(values);
@@ -485,6 +501,8 @@ void md_config_t::parse_env(unsigned entity_type,
   //   CRD) and is the target memory utilization we try to maintain for daemons
   //   that respect it.
   //
+  //   If POD_MEMORY_REQUEST is present, we use it as the target.
+  //
   // - Limits: At runtime, the container runtime (and Linux) will use the
   //   limits to see if the pod is using too many resources. In that case, the
   //   pod will be killed/restarted automatically if the pod goes over the limit.
@@ -492,28 +510,69 @@ void md_config_t::parse_env(unsigned entity_type,
   //   much higher). This corresponds to the cgroup memory limit that will
   //   trigger the Linux OOM killer.
   //
-  // Here are the documented best practices: https://kubernetes.io/docs/tasks/configure-pod-container/assign-cpu-resource/#motivation-for-cpu-requests-and-limits
+  //   If POD_MEMORY_LIMIT is present, we use it as the /default/ value for
+  //   the target, which means it will only apply if the *_memory_target option
+  //   isn't set via some other path (e.g., POD_MEMORY_REQUEST, or the cluster
+  //   config, or whatever.)
+  //
+  // Here are the documented best practices:
+  //   https://kubernetes.io/docs/tasks/configure-pod-container/assign-cpu-resource/#motivation-for-cpu-requests-and-limits
   //
   // When the operator creates the CephCluster CR, it will need to generate the
   // desired requests and limits. As long as we are conservative in our choice
   // for requests and generous with the limits we should be in a good place to
   // get started.
   //
-  // The support in Rook is already there for applying the limits as seen in these links.
+  // The support in Rook is already there for applying the limits as seen in
+  // these links.
   //
-  // Rook docs on the resource requests and limits: https://rook.io/docs/rook/v1.0/ceph-cluster-crd.html#cluster-wide-resources-configuration-settings
-  // Example CR settings: https://github.com/rook/rook/blob/6d2ef936698593036185aabcb00d1d74f9c7bfc1/cluster/examples/kubernetes/ceph/cluster.yaml#L90
-  if (auto pod_req = getenv("POD_MEMORY_REQUEST"); pod_req) {
+  // Rook docs on the resource requests and limits:
+  //   https://rook.io/docs/rook/v1.0/ceph-cluster-crd.html#cluster-wide-resources-configuration-settings
+  // Example CR settings:
+  //   https://github.com/rook/rook/blob/6d2ef936698593036185aabcb00d1d74f9c7bfc1/cluster/examples/kubernetes/ceph/cluster.yaml#L90
+  //
+  uint64_t pod_limit = 0, pod_request = 0;
+  if (auto pod_lim = getenv("POD_MEMORY_LIMIT"); pod_lim) {
     string err;
-    uint64_t v = atoll(pod_req);
+    uint64_t v = atoll(pod_lim);
     if (v) {
       switch (entity_type) {
       case CEPH_ENTITY_TYPE_OSD:
-	_set_val(values, tracker, stringify(v),
-		 *find_option("osd_memory_target"),
-		 CONF_ENV, &err);
-	break;
+        {
+	  double cgroup_ratio = get_val<double>(
+	    values, "osd_memory_target_cgroup_limit_ratio");
+	  if (cgroup_ratio > 0.0) {
+	    pod_limit = v * cgroup_ratio;
+	    // set osd_memory_target *default* based on cgroup limit, so that
+	    // it can be overridden by any explicit settings elsewhere.
+	    set_val_default(values, tracker,
+			    "osd_memory_target", stringify(pod_limit));
+	  }
+	}
       }
+    }
+  }
+  if (auto pod_req = getenv("POD_MEMORY_REQUEST"); pod_req) {
+    if (uint64_t v = atoll(pod_req); v) {
+      pod_request = v;
+    }
+  }
+  if (pod_request && pod_limit) {
+    // If both LIMIT and REQUEST are set, ensure that we use the
+    // min of request and limit*ratio.  This is important
+    // because k8s set set LIMIT == REQUEST if only LIMIT is
+    // specified, and we want to apply the ratio in that case,
+    // even though REQUEST is present.
+    pod_request = std::min<uint64_t>(pod_request, pod_limit);
+  }
+  if (pod_request) {
+    string err;
+    switch (entity_type) {
+    case CEPH_ENTITY_TYPE_OSD:
+      _set_val(values, tracker, stringify(pod_request),
+	       *find_option("osd_memory_target"),
+	       CONF_ENV, &err);
+      break;
     }
   }
 
@@ -611,6 +670,7 @@ int md_config_t::parse_argv(ConfigValues& values,
       set_val_or_die(values, tracker, "daemonize", "false");
     }
     else if (ceph_argparse_flag(args, i, "-d", (char*)NULL)) {
+      set_val_or_die(values, tracker, "fuse_debug", "true");
       set_val_or_die(values, tracker, "daemonize", "false");
       set_val_or_die(values, tracker, "log_file", "");
       set_val_or_die(values, tracker, "log_to_stderr", "true");
@@ -983,8 +1043,7 @@ Option::value_t md_config_t::get_val_generic(
   const ConfigValues& values,
   const std::string_view key) const
 {
-  string k(ConfFile::normalize_key_name(key));
-  return _get_val(values, k);
+  return _get_val(values, key);
 }
 
 Option::value_t md_config_t::_get_val(
@@ -1000,7 +1059,7 @@ Option::value_t md_config_t::_get_val(
   // In key names, leading and trailing whitespace are not significant.
   string k(ConfFile::normalize_key_name(key));
 
-  const Option *o = find_option(key);
+  const Option *o = find_option(k);
   if (!o) {
     // not a valid config option
     return Option::value_t(boost::blank());
@@ -1227,8 +1286,6 @@ int md_config_t::_get_val_cstr(
     return (l > len) ? -ENAMETOOLONG : 0;
   }
 
-  string k(ConfFile::normalize_key_name(key));
-
   // couldn't find a configuration option with key 'k'
   return -ENOENT;
 }
@@ -1263,7 +1320,7 @@ void md_config_t::_get_my_sections(const ConfigValues& values,
 {
   sections.push_back(values.name.to_str());
 
-  sections.push_back(values.name.get_type_name());
+  sections.push_back(values.name.get_type_name().data());
 
   sections.push_back("global");
 }
@@ -1336,7 +1393,7 @@ int md_config_t::_set_val(
     if (new_value != _get_val_nometa(values, opt)) {
       *error_message = string("Configuration option '") + opt.name +
 	"' may not be modified at runtime";
-      return -ENOSYS;
+      return -EPERM;
     }
   }
 
@@ -1485,14 +1542,16 @@ void md_config_t::diff(
   string name) const
 {
   values.for_each([this, f, &values] (auto& name, auto& configs) {
-    if (configs.size() == 1 &&
-	configs.begin()->first == CONF_DEFAULT) {
-      // we only have a default value; exclude from diff
+    if (configs.empty()) {
       return;
     }
     f->open_object_section(std::string{name}.c_str());
     const Option *o = find_option(name);
-    dump(f, CONF_DEFAULT, _get_val_default(*o));
+    if (configs.size() &&
+	configs.begin()->first != CONF_DEFAULT) {
+      // show compiled-in default only if an override default wasn't provided
+      dump(f, CONF_DEFAULT, _get_val_default(*o));
+    }
     for (auto& j : configs) {
       dump(f, j.first, j.second);
     }

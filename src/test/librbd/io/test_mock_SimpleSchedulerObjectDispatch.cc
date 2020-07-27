@@ -28,6 +28,25 @@ struct TypeTraits<MockTestImageCtx> {
   typedef ::MockSafeTimer SafeTimer;
 };
 
+template <>
+struct FlushTracker<MockTestImageCtx> {
+  FlushTracker(MockTestImageCtx*) {
+  }
+
+  void shut_down() {
+  }
+
+  void flush(Context*) {
+  }
+
+  void start_io(uint64_t) {
+  }
+
+  void finish_io(uint64_t) {
+  }
+
+};
+
 } // namespace io
 } // namespace librbd
 
@@ -45,10 +64,10 @@ struct TestMockIoSimpleSchedulerObjectDispatch : public TestMockFixture {
   typedef SimpleSchedulerObjectDispatch<librbd::MockTestImageCtx> MockSimpleSchedulerObjectDispatch;
 
   MockSafeTimer m_mock_timer;
-  Mutex m_mock_timer_lock;
+  ceph::mutex m_mock_timer_lock =
+    ceph::make_mutex("TestMockIoSimpleSchedulerObjectDispatch::Mutex");
 
-  TestMockIoSimpleSchedulerObjectDispatch()
-    : m_mock_timer_lock("TestMockIoSimpleSchedulerObjectDispatch::Mutex") {
+  TestMockIoSimpleSchedulerObjectDispatch() {
     MockTestImageCtx::set_timer_instance(&m_mock_timer, &m_mock_timer_lock);
     EXPECT_EQ(0, _rados.conf_set("rbd_io_scheduler_simple_max_delay", "1"));
   }
@@ -80,7 +99,7 @@ struct TestMockIoSimpleSchedulerObjectDispatch : public TestMockFixture {
 
   void expect_add_timer_task(Context **timer_task) {
     EXPECT_CALL(m_mock_timer, add_event_at(_, _))
-      .WillOnce(Invoke([timer_task](utime_t, Context *task) {
+      .WillOnce(Invoke([timer_task](ceph::real_clock::time_point, Context *task) {
                   *timer_task = task;
                   return task;
                 }));
@@ -97,7 +116,7 @@ struct TestMockIoSimpleSchedulerObjectDispatch : public TestMockFixture {
   }
 
   void run_timer_task(Context *timer_task) {
-    Mutex::Locker timer_locker(m_mock_timer_lock);
+    std::lock_guard timer_locker{m_mock_timer_lock};
     timer_task->complete(0);
   }
 };
@@ -208,10 +227,12 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, Flush) {
   MockSimpleSchedulerObjectDispatch
       mock_simple_scheduler_object_dispatch(&mock_image_ctx);
 
+  io::DispatchResult dispatch_result;
   C_SaferCond cond;
   Context *on_finish = &cond;
-  ASSERT_FALSE(mock_simple_scheduler_object_dispatch.flush(
-      FLUSH_SOURCE_USER, {}, nullptr, nullptr, &on_finish, nullptr));
+  ASSERT_TRUE(mock_simple_scheduler_object_dispatch.flush(
+      FLUSH_SOURCE_USER, {}, nullptr, &dispatch_result, &on_finish, nullptr));
+  ASSERT_EQ(io::DISPATCH_RESULT_CONTINUE, dispatch_result);
   ASSERT_EQ(on_finish, &cond); // not modified
   on_finish->complete(0);
   ASSERT_EQ(0, cond.wait());
@@ -251,7 +272,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, WriteDelayed) {
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish2,
       &on_dispatched));
   ASSERT_EQ(dispatch_result, io::DISPATCH_RESULT_COMPLETE);
-  ASSERT_EQ(on_finish2, &cond2);
+  ASSERT_NE(on_finish2, &cond2);
   ASSERT_NE(timer_task, nullptr);
 
   expect_dispatch_delayed_requests(mock_image_ctx, 0);
@@ -298,7 +319,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, WriteDelayedFlush) {
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish2,
       &on_dispatched));
   ASSERT_EQ(dispatch_result, io::DISPATCH_RESULT_COMPLETE);
-  ASSERT_EQ(on_finish2, &cond2);
+  ASSERT_NE(on_finish2, &cond2);
   ASSERT_NE(timer_task, nullptr);
 
   expect_dispatch_delayed_requests(mock_image_ctx, 0);
@@ -306,8 +327,9 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, WriteDelayedFlush) {
 
   C_SaferCond cond3;
   Context *on_finish3 = &cond3;
-  ASSERT_FALSE(mock_simple_scheduler_object_dispatch.flush(
-      FLUSH_SOURCE_USER, {}, nullptr, nullptr, &on_finish3, nullptr));
+  ASSERT_TRUE(mock_simple_scheduler_object_dispatch.flush(
+      FLUSH_SOURCE_USER, {}, nullptr, &dispatch_result, &on_finish3, nullptr));
+  ASSERT_EQ(io::DISPATCH_RESULT_CONTINUE, dispatch_result);
   ASSERT_EQ(on_finish3, &cond3);
 
   on_finish1->complete(0);
@@ -356,7 +378,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, WriteMerged) {
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish2,
       &on_dispatched2));
   ASSERT_EQ(dispatch_result, io::DISPATCH_RESULT_COMPLETE);
-  ASSERT_EQ(on_finish2, &cond2);
+  ASSERT_NE(on_finish2, &cond2);
   ASSERT_NE(timer_task, nullptr);
 
   object_off = 0;
@@ -370,7 +392,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, WriteMerged) {
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish3,
       &on_dispatched3));
   ASSERT_EQ(dispatch_result, io::DISPATCH_RESULT_COMPLETE);
-  ASSERT_EQ(on_finish3, &cond3);
+  ASSERT_NE(on_finish3, &cond3);
 
   object_off = 10;
   data.clear();
@@ -383,7 +405,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, WriteMerged) {
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish4,
       &on_dispatched4));
   ASSERT_EQ(dispatch_result, io::DISPATCH_RESULT_COMPLETE);
-  ASSERT_EQ(on_finish4, &cond4);
+  ASSERT_NE(on_finish4, &cond4);
 
   object_off = 30;
   data.clear();
@@ -396,7 +418,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, WriteMerged) {
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish5,
       &on_dispatched5));
   ASSERT_EQ(dispatch_result, io::DISPATCH_RESULT_COMPLETE);
-  ASSERT_EQ(on_finish5, &cond5);
+  ASSERT_NE(on_finish5, &cond5);
 
   object_off = 50;
   data.clear();
@@ -409,7 +431,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, WriteMerged) {
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish6,
       &on_dispatched6));
   ASSERT_EQ(dispatch_result, io::DISPATCH_RESULT_COMPLETE);
-  ASSERT_EQ(on_finish6, &cond6);
+  ASSERT_NE(on_finish6, &cond6);
 
   // expect two requests dispatched:
   // 0~40 (merged 0~10, 10~10, 20~10, 30~10) and 50~10
@@ -472,7 +494,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, WriteNonSequential) {
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish2,
       &on_dispatched2));
   ASSERT_EQ(dispatch_result, io::DISPATCH_RESULT_COMPLETE);
-  ASSERT_EQ(on_finish2, &cond2);
+  ASSERT_NE(on_finish2, &cond2);
   ASSERT_NE(timer_task, nullptr);
 
   expect_dispatch_delayed_requests(mock_image_ctx, 0);
@@ -536,7 +558,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, Mixed) {
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish2,
       &on_dispatched2));
   ASSERT_EQ(dispatch_result, io::DISPATCH_RESULT_COMPLETE);
-  ASSERT_EQ(on_finish2, &cond2);
+  ASSERT_NE(on_finish2, &cond2);
   ASSERT_NE(timer_task, nullptr);
 
   // write (3) 10~10 (delayed)
@@ -551,7 +573,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, Mixed) {
       0, object_off, std::move(data), mock_image_ctx.snapc, 0, {},
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish3,
       &on_dispatched3));
-  ASSERT_EQ(on_finish3, &cond3);
+  ASSERT_NE(on_finish3, &cond3);
 
   // discard (1) (non-seq io)
   // will dispatch the delayed writes (2) and (3) and wrap on_finish
@@ -581,7 +603,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, Mixed) {
       0, object_off, std::move(data), mock_image_ctx.snapc, 0, {},
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish5,
       &on_dispatched5));
-  ASSERT_EQ(on_finish5, &cond5);
+  ASSERT_NE(on_finish5, &cond5);
   ASSERT_NE(timer_task, nullptr);
 
   // discard (2) (non-seq io)
@@ -611,7 +633,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, Mixed) {
       0, object_off, std::move(data), mock_image_ctx.snapc, 0, {},
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish7,
       &on_dispatched7));
-  ASSERT_EQ(on_finish7, &cond7);
+  ASSERT_NE(on_finish7, &cond7);
   ASSERT_NE(timer_task, nullptr);
 
   // write (1) finishes
@@ -688,7 +710,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, DispatchQueue) {
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish2,
       &on_dispatched2));
   ASSERT_EQ(dispatch_result, io::DISPATCH_RESULT_COMPLETE);
-  ASSERT_EQ(on_finish2, &cond2);
+  ASSERT_NE(on_finish2, &cond2);
   ASSERT_NE(timer_task, nullptr);
 
   // send 2 writes to object 1
@@ -711,7 +733,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, DispatchQueue) {
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish4,
       &on_dispatched4));
   ASSERT_EQ(dispatch_result, io::DISPATCH_RESULT_COMPLETE);
-  ASSERT_EQ(on_finish4, &cond4);
+  ASSERT_NE(on_finish4, &cond4);
 
   // finish write (1) to object 0
   expect_dispatch_delayed_requests(mock_image_ctx, 0);
@@ -771,7 +793,7 @@ TEST_F(TestMockIoSimpleSchedulerObjectDispatch, Timer) {
       &object_dispatch_flags, nullptr, &dispatch_result, &on_finish2,
       &on_dispatched));
   ASSERT_EQ(dispatch_result, io::DISPATCH_RESULT_COMPLETE);
-  ASSERT_EQ(on_finish2, &cond2);
+  ASSERT_NE(on_finish2, &cond2);
   ASSERT_NE(timer_task, nullptr);
 
   expect_dispatch_delayed_requests(mock_image_ctx, 0);

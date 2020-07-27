@@ -11,7 +11,7 @@
 #include "common/Formatter.h"
 #include "common/TextTable.h"
 #include <iostream>
-#include <boost/bind.hpp>
+#include <boost/bind/bind.hpp>
 #include <boost/program_options.hpp>
 #include "global/global_context.h"
 
@@ -22,6 +22,7 @@ namespace list {
 
 namespace at = argument_types;
 namespace po = boost::program_options;
+using namespace boost::placeholders;
 
 enum WorkerState {
   STATE_IDLE = 0,
@@ -34,6 +35,7 @@ struct WorkerEntry {
   librbd::RBD::AioCompletion* completion;
   WorkerState state;
   string name;
+  string id;
 
   WorkerEntry() {
     state = STATE_IDLE;
@@ -86,6 +88,7 @@ int list_process_image(librados::Rados* rados, WorkerEntry* w, bool lflag, Forma
   if (f) {
     f->open_object_section("image");
     f->dump_string("image", w->name);
+    f->dump_string("id", w->id);
     f->dump_unsigned("size", info.size);
     if (has_parent) {
       f->open_object_section("parent");
@@ -135,7 +138,9 @@ int list_process_image(librados::Rados* rados, WorkerEntry* w, bool lflag, Forma
       if (f) {
         f->open_object_section("snapshot");
         f->dump_string("image", w->name);
+        f->dump_string("id", w->id);
         f->dump_string("snapshot", s->name);
+        f->dump_unsigned("snapshot_id", s->id);
         f->dump_unsigned("size", s->size);
         if (has_parent) {
           f->open_object_section("parent");
@@ -240,6 +245,7 @@ int do_list(const std::string &pool_name, const std::string& namespace_name,
 	    continue;
 	  }
 	  comp->name = i->name;
+          comp->id = i->id;
 	  comp->completion = new librbd::RBD::AioCompletion(nullptr, nullptr);
 	  r = rbd.aio_open_read_only(ioctx, comp->img, i->name.c_str(), nullptr,
                                      comp->completion);

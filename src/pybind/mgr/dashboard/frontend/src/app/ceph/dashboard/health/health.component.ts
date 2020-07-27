@@ -1,8 +1,7 @@
 import { Component, OnDestroy, OnInit } from '@angular/core';
 
-import { I18n } from '@ngx-translate/i18n-polyfill';
 import * as _ from 'lodash';
-import { Subscription } from 'rxjs/Subscription';
+import { Subscription } from 'rxjs';
 
 import { HealthService } from '../../../shared/api/health.service';
 import { Icons } from '../../../shared/enum/icons.enum';
@@ -65,7 +64,6 @@ export class HealthComponent implements OnInit, OnDestroy {
 
   constructor(
     private healthService: HealthService,
-    private i18n: I18n,
     private authStorageService: AuthStorageService,
     private pgCategoryService: PgCategoryService,
     private featureToggles: FeatureTogglesService,
@@ -78,7 +76,6 @@ export class HealthComponent implements OnInit, OnDestroy {
   }
 
   ngOnInit() {
-    this.getHealth();
     this.interval = this.refreshIntervalService.intervalData$.subscribe(() => {
       this.getHealth();
     });
@@ -94,7 +91,7 @@ export class HealthComponent implements OnInit, OnDestroy {
     });
   }
 
-  prepareReadWriteRatio(chart) {
+  prepareReadWriteRatio(chart: Record<string, any>) {
     const ratioLabels = [];
     const ratioData = [];
 
@@ -102,14 +99,14 @@ export class HealthComponent implements OnInit, OnDestroy {
       this.healthData.client_perf.write_op_per_sec + this.healthData.client_perf.read_op_per_sec;
 
     ratioLabels.push(
-      `${this.i18n('Writes')} (${this.calcPercentage(
+      `${$localize`Writes`} (${this.calcPercentage(
         this.healthData.client_perf.write_op_per_sec,
         total
       )}%)`
     );
     ratioData.push(this.healthData.client_perf.write_op_per_sec);
     ratioLabels.push(
-      `${this.i18n('Reads')} (${this.calcPercentage(
+      `${$localize`Reads`} (${this.calcPercentage(
         this.healthData.client_perf.read_op_per_sec,
         total
       )}%)`
@@ -120,7 +117,7 @@ export class HealthComponent implements OnInit, OnDestroy {
     chart.labels = ratioLabels;
   }
 
-  prepareRawUsage(chart, data) {
+  prepareRawUsage(chart: Record<string, any>, data: Record<string, any>) {
     const percentAvailable = this.calcPercentage(
       data.df.stats.total_bytes - data.df.stats.total_used_raw_bytes,
       data.df.stats.total_bytes
@@ -133,21 +130,22 @@ export class HealthComponent implements OnInit, OnDestroy {
     chart.dataset[0].data = [data.df.stats.total_used_raw_bytes, data.df.stats.total_avail_bytes];
 
     chart.labels = [
-      `${this.dimlessBinary.transform(data.df.stats.total_used_raw_bytes)} ${this.i18n(
-        'Used'
-      )} (${percentUsed}%)`,
-      `${this.dimlessBinary.transform(
+      $localize`${this.dimlessBinary.transform(
+        data.df.stats.total_used_raw_bytes
+      )} Used (${percentUsed}%)`,
+      $localize`${this.dimlessBinary.transform(
         data.df.stats.total_bytes - data.df.stats.total_used_raw_bytes
-      )} ${this.i18n('Avail.')} (${percentAvailable}%)`
+      )} Avail. (${percentAvailable}%)`
     ];
 
     chart.options.title.text = `${this.dimlessBinary.transform(
       data.df.stats.total_bytes
-    )} ${this.i18n('total')}`;
+    )} ${$localize`total`}`;
   }
 
-  preparePgStatus(chart, data) {
-    const categoryPgAmount = {};
+  preparePgStatus(chart: Record<string, any>, data: Record<string, any>) {
+    const categoryPgAmount: Record<string, number> = {};
+    let totalPgs = 0;
 
     _.forEach(data.pg_info.statuses, (pgAmount, pgStatesText) => {
       const categoryType = this.pgCategoryService.getTypeByStates(pgStatesText);
@@ -156,6 +154,7 @@ export class HealthComponent implements OnInit, OnDestroy {
         categoryPgAmount[categoryType] = 0;
       }
       categoryPgAmount[categoryType] += pgAmount;
+      totalPgs += pgAmount;
     });
 
     chart.dataset[0].data = this.pgCategoryService
@@ -163,26 +162,14 @@ export class HealthComponent implements OnInit, OnDestroy {
       .map((categoryType) => categoryPgAmount[categoryType]);
 
     chart.labels = [
-      `${this.i18n('Clean')} (${this.calcPercentage(
-        categoryPgAmount['clean'],
-        data.pg_info.pgs_per_osd
-      )}%)`,
-      `${this.i18n('Working')} (${this.calcPercentage(
-        categoryPgAmount['working'],
-        data.pg_info.pgs_per_osd
-      )}%)`,
-      `${this.i18n('Warning')} (${this.calcPercentage(
-        categoryPgAmount['warning'],
-        data.pg_info.pgs_per_osd
-      )}%)`,
-      `${this.i18n('Unknown')} (${this.calcPercentage(
-        categoryPgAmount['unknown'],
-        data.pg_info.pgs_per_osd
-      )}%)`
+      `${$localize`Clean`} (${this.calcPercentage(categoryPgAmount['clean'], totalPgs)}%)`,
+      `${$localize`Working`} (${this.calcPercentage(categoryPgAmount['working'], totalPgs)}%)`,
+      `${$localize`Warning`} (${this.calcPercentage(categoryPgAmount['warning'], totalPgs)}%)`,
+      `${$localize`Unknown`} (${this.calcPercentage(categoryPgAmount['unknown'], totalPgs)}%)`
     ];
   }
 
-  prepareObjects(chart, data) {
+  prepareObjects(chart: Record<string, any>, data: Record<string, any>) {
     const totalReplicas = data.pg_info.object_stats.num_object_copies;
     const healthy =
       totalReplicas -
@@ -191,16 +178,16 @@ export class HealthComponent implements OnInit, OnDestroy {
       data.pg_info.object_stats.num_objects_unfound;
 
     chart.labels = [
-      `${this.i18n('Healthy')} (${this.calcPercentage(healthy, totalReplicas)}%)`,
-      `${this.i18n('Misplaced')} (${this.calcPercentage(
+      `${$localize`Healthy`} (${this.calcPercentage(healthy, totalReplicas)}%)`,
+      `${$localize`Misplaced`} (${this.calcPercentage(
         data.pg_info.object_stats.num_objects_misplaced,
         totalReplicas
       )}%)`,
-      `${this.i18n('Degraded')} (${this.calcPercentage(
+      `${$localize`Degraded`} (${this.calcPercentage(
         data.pg_info.object_stats.num_objects_degraded,
         totalReplicas
       )}%)`,
-      `${this.i18n('Unfound')} (${this.calcPercentage(
+      `${$localize`Unfound`} (${this.calcPercentage(
         data.pg_info.object_stats.num_objects_unfound,
         totalReplicas
       )}%)`
@@ -215,7 +202,7 @@ export class HealthComponent implements OnInit, OnDestroy {
 
     chart.options.title.text = `${this.dimless.transform(
       data.pg_info.object_stats.num_objects
-    )} ${this.i18n('total')} (${this.dimless.transform(totalReplicas)} ${this.i18n('replicas')})`;
+    )} ${$localize`total`} (${this.dimless.transform(totalReplicas)} ${$localize`replicas`})`;
 
     chart.options.maintainAspectRatio = window.innerWidth >= 375;
   }

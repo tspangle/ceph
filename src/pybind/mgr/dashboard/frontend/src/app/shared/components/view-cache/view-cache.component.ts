@@ -1,20 +1,16 @@
-import { Component, Input, OnInit } from '@angular/core';
+import { Component, Input } from '@angular/core';
 
-import { ViewCacheStatus } from '../../../shared/enum/view-cache-status.enum';
+import { ViewCacheStatus } from '../../enum/view-cache-status.enum';
 
 @Component({
   selector: 'cd-view-cache',
   templateUrl: './view-cache.component.html',
   styleUrls: ['./view-cache.component.scss']
 })
-export class ViewCacheComponent implements OnInit {
+export class ViewCacheComponent {
   @Input()
   status: ViewCacheStatus;
   @Input()
   statusFor: string;
   vcs = ViewCacheStatus;
-
-  constructor() {}
-
-  ngOnInit() {}
 }

@@ -16,6 +16,7 @@
  *
 */
 
+#include "acconfig.h"
 #include "include/int_types.h"
 
 #include <libgen.h>
@@ -46,6 +47,7 @@
 
 #include "common/Formatter.h"
 #include "common/Preforker.h"
+#include "common/SubProcess.h"
 #include "common/TextTable.h"
 #include "common/ceph_argparse.h"
 #include "common/config.h"
@@ -76,6 +78,7 @@ struct Config {
   int timeout = -1;
 
   bool exclusive = false;
+  bool quiesce = false;
   bool readonly = false;
   bool set_max_part = false;
   bool try_netlink = false;
@@ -85,6 +88,7 @@ struct Config {
   std::string imgname;
   std::string snapname;
   std::string devpath;
+  std::string quiesce_hook = CMAKE_INSTALL_LIBEXECDIR "/rbd-nbd/rbd-nbd_quiesce";
 
   std::string format;
   bool pretty_format = false;
@@ -97,10 +101,13 @@ static void usage()
             << "               [options] list-mapped               List mapped nbd devices\n"
             << "Map options:\n"
             << "  --device <device path>  Specify nbd device path (/dev/nbd{num})\n"
-            << "  --read-only             Map read-only\n"
-            << "  --nbds_max <limit>      Override for module param nbds_max\n"
-            << "  --max_part <limit>      Override for module param max_part\n"
             << "  --exclusive             Forbid writes by other clients\n"
+            << "  --max_part <limit>      Override for module param max_part\n"
+            << "  --nbds_max <limit>      Override for module param nbds_max\n"
+            << "  --quiesce               Use quiesce callbacks\n"
+            << "  --quiesce_hook <path>   Specify quiesce hook path\n"
+            << "                          (default: " << Config().quiesce_hook << ")\n"
+            << "  --read-only             Map read-only\n"
             << "  --timeout <seconds>     Set nbd request timeout\n"
             << "  --try-netlink           Use the nbd netlink interface\n"
             << "\n"
@@ -141,27 +148,45 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
                       Command *command, Config *cfg);
 static int netlink_resize(int nbd_index, uint64_t size);
 
+static void run_quiesce_hook(const std::string &quiesce_hook,
+                             const std::string &devpath,
+                             const std::string &command);
+
 class NBDServer
 {
 private:
   int fd;
   librbd::Image &image;
+  Config *cfg;
 
 public:
-  NBDServer(int _fd, librbd::Image& _image)
-    : fd(_fd)
-    , image(_image)
-    , disconnect_lock("NBDServer::DisconnectLocker")
-    , lock("NBDServer::Locker")
+  NBDServer(int fd, librbd::Image& image, Config *cfg)
+    : fd(fd)
+    , image(image)
+    , cfg(cfg)
     , reader_thread(*this, &NBDServer::reader_entry)
     , writer_thread(*this, &NBDServer::writer_entry)
+    , quiesce_thread(*this, &NBDServer::quiesce_entry)
     , started(false)
-  {}
+  {
+    std::vector<librbd::config_option_t> options;
+    image.config_list(&options);
+    for (auto &option : options) {
+      if ((option.name == std::string("rbd_cache") ||
+           option.name == std::string("rbd_cache_writethrough_until_flush")) &&
+          option.value == "false") {
+        allow_internal_flush = true;
+        break;
+      }
+    }
+  }
 
 private:
-  Mutex disconnect_lock;
-  Cond disconnect_cond;
+  ceph::mutex disconnect_lock =
+    ceph::make_mutex("NBDServer::DisconnectLocker");
+  ceph::condition_variable disconnect_cond;
   std::atomic<bool> terminated = { false };
+  std::atomic<bool> allow_internal_flush = { false };
 
   void shutdown()
   {
@@ -169,8 +194,8 @@ private:
     if (terminated.compare_exchange_strong(expected, true)) {
       ::shutdown(fd, SHUT_RDWR);
 
-      Mutex::Locker l(lock);
-      cond.Signal();
+      std::lock_guard l{lock};
+      cond.notify_all();
     }
   }
 
@@ -190,31 +215,30 @@ private:
 
   friend std::ostream &operator<<(std::ostream &os, const IOContext &ctx);
 
-  Mutex lock;
-  Cond cond;
+  ceph::mutex lock = ceph::make_mutex("NBDServer::Locker");
+  ceph::condition_variable cond;
   xlist<IOContext*> io_pending;
   xlist<IOContext*> io_finished;
 
   void io_start(IOContext *ctx)
   {
-    Mutex::Locker l(lock);
+    std::lock_guard l{lock};
     io_pending.push_back(&ctx->item);
   }
 
   void io_finish(IOContext *ctx)
   {
-    Mutex::Locker l(lock);
+    std::lock_guard l{lock};
     ceph_assert(ctx->item.is_on_list());
     ctx->item.remove_myself();
     io_finished.push_back(&ctx->item);
-    cond.Signal();
+    cond.notify_all();
   }
 
   IOContext *wait_io_finish()
   {
-    Mutex::Locker l(lock);
-    while(io_finished.empty() && !terminated)
-      cond.Wait(lock);
+    std::unique_lock l{lock};
+    cond.wait(l, [this] { return !io_finished.empty() || terminated; });
 
     if (io_finished.empty())
       return NULL;
@@ -228,9 +252,8 @@ private:
   void wait_clean()
   {
     ceph_assert(!reader_thread.is_started());
-    Mutex::Locker l(lock);
-    while(!io_pending.empty())
-      cond.Wait(lock);
+    std::unique_lock l{lock};
+    cond.wait(l, [this] { return io_pending.empty(); });
 
     while(!io_finished.empty()) {
       std::unique_ptr<IOContext> free_ctx(io_finished.front());
@@ -335,6 +358,7 @@ private:
           break;
         case NBD_CMD_FLUSH:
           image.aio_flush(c);
+          allow_internal_flush = true;
           break;
         case NBD_CMD_TRIM:
           image.aio_discard(pctx->request.from, pctx->request.len, c);
@@ -348,8 +372,8 @@ private:
     dout(20) << __func__ << ": terminated" << dendl;
 
 signal:
-    Mutex::Locker l(disconnect_lock);
-    disconnect_cond.Signal();
+    std::lock_guard l{disconnect_lock};
+    disconnect_cond.notify_all();
   }
 
   void writer_entry()
@@ -383,6 +407,70 @@ signal:
     dout(20) << __func__ << ": terminated" << dendl;
   }
 
+  bool wait_quiesce() {
+    dout(20) << __func__ << dendl;
+
+    std::unique_lock locker{lock};
+    cond.wait(locker, [this] { return quiesce || terminated; });
+
+    if (terminated) {
+      return false;
+    }
+
+    dout(20) << __func__ << ": got quiesce request" << dendl;
+    return true;
+  }
+
+  void wait_unquiesce() {
+    dout(20) << __func__ << dendl;
+
+    std::unique_lock locker{lock};
+    cond.wait(locker, [this] { return !quiesce || terminated; });
+
+    dout(20) << __func__ << ": got unquiesce request" << dendl;
+  }
+
+  void wait_inflight_io() {
+    if (!allow_internal_flush) {
+        return;
+    }
+
+    uint64_t features = 0;
+    image.features(&features);
+    if ((features & RBD_FEATURE_EXCLUSIVE_LOCK) != 0) {
+      bool is_owner = false;
+      image.is_exclusive_lock_owner(&is_owner);
+      if (!is_owner) {
+        return;
+      }
+    }
+
+    dout(20) << __func__ << dendl;
+
+    int r = image.flush();
+    if (r < 0) {
+      derr << "flush failed: " << cpp_strerror(r) << dendl;
+    }
+  }
+
+  void quiesce_entry()
+  {
+    ceph_assert(cfg->quiesce);
+
+    while (wait_quiesce()) {
+
+      run_quiesce_hook(cfg->quiesce_hook, cfg->devpath, "quiesce");
+
+      wait_inflight_io();
+
+      image.quiesce_complete(0); // TODO: return quiesce hook exit code
+
+      wait_unquiesce();
+
+      run_quiesce_hook(cfg->quiesce_hook, cfg->devpath, "unquiesce");
+    }
+  }
+
   class ThreadHelper : public Thread
   {
   public:
@@ -402,9 +490,11 @@ signal:
       server.shutdown();
       return NULL;
     }
-  } reader_thread, writer_thread;
+  } reader_thread, writer_thread, quiesce_thread;
 
   bool started;
+  bool quiesce;
+
 public:
   void start()
   {
@@ -415,6 +505,9 @@ public:
 
       reader_thread.create("rbd_reader");
       writer_thread.create("rbd_writer");
+      if (cfg->quiesce) {
+        quiesce_thread.create("rbd_quiesce");
+      }
     }
   }
 
@@ -423,8 +516,30 @@ public:
     if (!started)
       return;
 
-    Mutex::Locker l(disconnect_lock);
-    disconnect_cond.Wait(disconnect_lock);
+    std::unique_lock l{disconnect_lock};
+    disconnect_cond.wait(l);
+  }
+
+  void notify_quiesce() {
+    dout(10) << __func__ << dendl;
+
+    ceph_assert(cfg->quiesce);
+
+    std::unique_lock locker{lock};
+    ceph_assert(quiesce == false);
+    quiesce = true;
+    cond.notify_all();
+  }
+
+  void notify_unquiesce() {
+    dout(10) << __func__ << dendl;
+
+    ceph_assert(cfg->quiesce);
+
+    std::unique_lock locker{lock};
+    ceph_assert(quiesce == true);
+    quiesce = false;
+    cond.notify_all();
   }
 
   ~NBDServer()
@@ -436,6 +551,9 @@ public:
 
       reader_thread.join();
       writer_thread.join();
+      if (cfg->quiesce) {
+        quiesce_thread.join();
+      }
 
       wait_clean();
 
@@ -472,6 +590,24 @@ std::ostream &operator<<(std::ostream &os, const NBDServer::IOContext &ctx) {
 
   return os;
 }
+
+class NBDQuiesceWatchCtx : public librbd::QuiesceWatchCtx
+{
+public:
+  NBDQuiesceWatchCtx(NBDServer *server) : server(server) {
+  }
+
+  void handle_quiesce() override {
+    server->notify_quiesce();
+  }
+
+  void handle_unquiesce() override {
+    server->notify_unquiesce();
+  }
+
+private:
+  NBDServer *server;
+};
 
 class NBDWatchCtx : public librbd::UpdateWatchCtx
 {
@@ -1050,6 +1186,31 @@ static int try_netlink_setup(Config *cfg, int fd, uint64_t size, uint64_t flags)
   return 0;
 }
 
+static void run_quiesce_hook(const std::string &quiesce_hook,
+                             const std::string &devpath,
+                             const std::string &command) {
+  dout(10) << __func__ << ": " << quiesce_hook << " " << devpath << " "
+           << command << dendl;
+
+  SubProcess hook(quiesce_hook.c_str(), SubProcess::CLOSE, SubProcess::PIPE,
+                  SubProcess::PIPE);
+  hook.add_cmd_args(devpath.c_str(), command.c_str(), NULL);
+  bufferlist err;
+  int r = hook.spawn();
+  if (r != 0) {
+    err.append("subprocess spawn failed");
+  } else {
+    err.read_fd(hook.get_stderr(), 16384);
+    r = hook.join();
+  }
+  if (r != 0) {
+    derr << __func__ << ": " << quiesce_hook << " " << devpath << " "
+         << command << " failed: " << err.to_str() << dendl;
+  } else {
+    dout(10) << " succeeded: " << err.to_str() << dendl;
+  }
+}
+
 static void handle_signal(int signum)
 {
   int ret;
@@ -1074,11 +1235,11 @@ static void handle_signal(int signum)
   }
 }
 
-static NBDServer *start_server(int fd, librbd::Image& image)
+static NBDServer *start_server(int fd, librbd::Image& image, Config *cfg)
 {
   NBDServer *server;
 
-  server = new NBDServer(fd, image);
+  server = new NBDServer(fd, image, cfg);
   server->start();
 
   init_async_signal_handler();
@@ -1224,7 +1385,7 @@ static int do_map(int argc, const char *argv[], Config *cfg)
   if (r < 0)
     goto close_fd;
 
-  server = start_server(fd[1], image);
+  server = start_server(fd[1], image, cfg);
 
   use_netlink = cfg->try_netlink;
   if (use_netlink) {
@@ -1253,6 +1414,15 @@ static int do_map(int argc, const char *argv[], Config *cfg)
   }
 
   {
+    NBDQuiesceWatchCtx quiesce_watch_ctx(server);
+    uint64_t quiesce_watch_handle;
+    if (cfg->quiesce) {
+      r = image.quiesce_watch(&quiesce_watch_ctx, &quiesce_watch_handle);
+      if (r < 0) {
+        goto close_nbd;
+      }
+    }
+
     uint64_t handle;
 
     NBDWatchCtx watch_ctx(nbd, nbd_index, use_netlink, io_ctx, image,
@@ -1264,6 +1434,11 @@ static int do_map(int argc, const char *argv[], Config *cfg)
     cout << cfg->devpath << std::endl;
 
     run_server(forker, server, use_netlink);
+
+    if (cfg->quiesce) {
+      r = image.quiesce_unwatch(quiesce_watch_handle);
+      ceph_assert(r == 0);
+    }
 
     r = image.update_unwatch(handle);
     ceph_assert(r == 0);
@@ -1469,6 +1644,10 @@ static int parse_args(vector<const char*>& args, std::ostream *err_msg,
         return -EINVAL;
       }
       cfg->set_max_part = true;
+    } else if (ceph_argparse_flag(args, i, "--quiesce", (char *)NULL)) {
+      cfg->quiesce = true;
+    } else if (ceph_argparse_witharg(args, i, &cfg->quiesce_hook,
+                                     "--quiesce-hook", (char *)NULL)) {
     } else if (ceph_argparse_flag(args, i, "--read-only", (char *)NULL)) {
       cfg->readonly = true;
     } else if (ceph_argparse_flag(args, i, "--exclusive", (char *)NULL)) {

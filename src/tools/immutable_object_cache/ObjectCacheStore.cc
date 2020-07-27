@@ -17,8 +17,7 @@ namespace ceph {
 namespace immutable_obj_cache {
 
 ObjectCacheStore::ObjectCacheStore(CephContext *cct)
-      : m_cct(cct), m_rados(new librados::Rados()),
-        m_ioctx_map_lock("ceph::cache::ObjectCacheStore::m_ioctx_map_lock") {
+      : m_cct(cct), m_rados(new librados::Rados()) {
 
   m_cache_root_dir =
     m_cct->_conf.get_val<std::string>("immutable_object_cache_path");
@@ -61,17 +60,19 @@ int ObjectCacheStore::init(bool reset) {
 
   // TODO(dehao): fsck and reuse existing cache objects
   if (reset) {
-    std::error_code ec;
-    if (efs::exists(m_cache_root_dir)) {
-      // remove all sub folders
-      for (auto& p : efs::directory_iterator(m_cache_root_dir)) {
-        efs::remove_all(p.path());
+    try {
+      if (efs::exists(m_cache_root_dir)) {
+        // remove all sub folders
+        for (auto& p : efs::directory_iterator(m_cache_root_dir)) {
+          efs::remove_all(p.path());
+        }
+      } else {
+        efs::create_directories(m_cache_root_dir);
       }
-    } else {
-      if (!efs::create_directories(m_cache_root_dir, ec)) {
-        lderr(m_cct) << "fail to create cache store dir: " << ec << dendl;
-        return ec.value();
-      }
+    } catch (const efs::filesystem_error& e) {
+      lderr(m_cct) << "failed to initialize cache store directory: "
+                   << e.what() << dendl;
+      return -e.code().value();
     }
   }
   return 0;
@@ -103,7 +104,7 @@ int ObjectCacheStore::do_promote(std::string pool_nspace,
   std::string cache_file_name = get_cache_file_name(pool_nspace, pool_id, snap_id, object_name);
   librados::IoCtx ioctx;
   {
-    Mutex::Locker _locker(m_ioctx_map_lock);
+    std::lock_guard _locker{m_ioctx_map_lock};
     if (m_ioctx_map.find(pool_id) == m_ioctx_map.end()) {
       ret = m_rados->ioctx_create2(pool_id, ioctx);
       if (ret < 0) {
@@ -121,7 +122,7 @@ int ObjectCacheStore::do_promote(std::string pool_nspace,
 
   librados::bufferlist* read_buf = new librados::bufferlist();
 
-  auto ctx = new FunctionContext([this, read_buf, cache_file_name](int ret) {
+  auto ctx = new LambdaContext([this, read_buf, cache_file_name](int ret) {
     handle_promote_callback(ret, read_buf, cache_file_name);
   });
 

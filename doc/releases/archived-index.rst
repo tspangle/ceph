@@ -5,7 +5,9 @@ Archived Releases
 .. toctree::
    :maxdepth: 1
 
+   Luminous <luminous>
    Kraken <kraken>
+   Jewel <jewel>
    Infernalis <infernalis>
    Hammer <hammer>
    Giant <giant>

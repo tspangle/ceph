@@ -539,7 +539,7 @@ void wait_until_done(ObjectStore::Transaction* txn, Func&& func)
   bool finished = false;
   std::condition_variable cond;
   std::mutex m;
-  txn->register_on_complete(make_lambda_context([&]() {
+  txn->register_on_complete(make_lambda_context([&](int) {
     std::unique_lock lock{m};
     finished = true;
     cond.notify_one();
@@ -577,16 +577,21 @@ int write_info(ObjectStore::Transaction &t, epoch_t epoch, pg_info_t &info,
   coll_t coll(info.pgid);
   ghobject_t pgmeta_oid(info.pgid.make_pgmeta_oid());
   map<string,bufferlist> km;
+  string key_to_remove;
   pg_info_t last_written_info;
   int ret = prepare_info_keymap(
     g_ceph_context,
-    &km, epoch,
+    &km, &key_to_remove,
+    epoch,
     info,
     last_written_info,
     past_intervals,
     true, true, false);
   if (ret) cerr << "Failed to write info" << std::endl;
   t.omap_setkeys(coll, pgmeta_oid, km);
+  if (!key_to_remove.empty()) {
+    t.omap_rmkey(coll, pgmeta_oid, key_to_remove);
+  }
   return ret;
 }
 
@@ -676,7 +681,7 @@ int do_trim_pg_log(ObjectStore *store, const coll_t &coll,
       try {
 	e.decode_with_checksum(bp);
       } catch (const buffer::error &e) {
-	cerr << "Error reading pg log entry: " << e << std::endl;
+	cerr << "Error reading pg log entry: " << e.what() << std::endl;
       }
       if (debug) {
 	cerr << "read entry " << e << std::endl;
@@ -1972,9 +1977,7 @@ int ObjectStoreTool::do_import(ObjectStore *store, OSDSuperblock& sb,
     cerr << "done, clearing removal flag" << std::endl;
 
   if (!dry_run) {
-    set<string> remove;
-    remove.insert("_remove");
-    t.omap_rmkeys(coll, pgid.make_pgmeta_oid(), remove);
+    t.omap_rmkey(coll, pgid.make_pgmeta_oid(), "_remove");
     wait_until_done(&t, [&] {
       store->queue_transaction(ch, std::move(t));
       // make sure we flush onreadable items before mapper/driver are destroyed.
@@ -2083,7 +2086,9 @@ int do_remove_object(ObjectStore *store, coll_t coll,
     r = get_snapset(store, coll, ghobj, ss, false);
     if (r < 0) {
       cerr << "Can't get snapset error " << cpp_strerror(r) << std::endl;
-      return r;
+      // If --force and bad snapset let them remove the head
+      if (!(force && !all))
+        return r;
     }
 //    cout << "snapset " << ss << std::endl;
     if (!ss.clone_snaps.empty() && !all) {
@@ -2393,9 +2398,6 @@ int do_rm_omap(ObjectStore *store, coll_t coll,
 {
   ObjectStore::Transaction tran;
   ObjectStore::Transaction *t = &tran;
-  set<string> keys;
-
-  keys.insert(key);
 
   if (debug)
     cerr << "Rm_omap " << ghobj << std::endl;
@@ -2403,7 +2405,7 @@ int do_rm_omap(ObjectStore *store, coll_t coll,
   if (dry_run)
     return 0;
 
-  t->omap_rmkeys(coll, ghobj, keys);
+  t->omap_rmkey(coll, ghobj, key);
 
   auto ch = store->open_collection(coll);
   store->queue_transaction(ch, std::move(*t));
@@ -3197,7 +3199,7 @@ int main(int argc, char **argv)
   ghobject_t ghobj;
   bool human_readable;
   Formatter *formatter;
-  bool head;
+  bool head, tty;
 
   po::options_description desc("Allowed options");
   desc.add_options()
@@ -3214,7 +3216,7 @@ int main(int argc, char **argv)
      "Pool name, mandatory for apply-layout-settings if --pgid is not specified")
     ("op", po::value<string>(&op),
      "Arg is one of [info, log, remove, mkfs, fsck, repair, fuse, dup, export, export-remove, import, list, list-slow-omap, fix-lost, list-pgs, dump-journal, dump-super, meta-list, "
-     "get-osdmap, set-osdmap, get-inc-osdmap, set-inc-osdmap, mark-complete, reset-last-complete, apply-layout-settings, update-mon-db, dump-export, trim-pg-log]")
+     "get-osdmap, set-osdmap, get-inc-osdmap, set-inc-osdmap, mark-complete, reset-last-complete, apply-layout-settings, update-mon-db, dump-export, trim-pg-log, statfs]")
     ("epoch", po::value<unsigned>(&epoch),
      "epoch# for get-osdmap and get-inc-osdmap, the current epoch in use if not specified")
     ("file", po::value<string>(&file),
@@ -3237,6 +3239,7 @@ int main(int argc, char **argv)
     ("skip-mount-omap", "Disable mounting of omap")
     ("head", "Find head/snapdir when searching for objects by name")
     ("dry-run", "Don't modify the objectstore")
+    ("tty", "Treat stdout as a tty (no binary data)")
     ("namespace", po::value<string>(&argnspace), "Specify namespace when searching for objects")
     ("rmtype", po::value<string>(&rmtypestr), "Specify corrupting object removal 'snapmap' or 'nosnapmap' - TESTING USE ONLY")
     ("slow-omap-threshold", po::value<unsigned>(&slow_threshold),
@@ -3291,6 +3294,7 @@ int main(int argc, char **argv)
     nspace = argnspace;
 
   dry_run = (vm.count("dry-run") > 0);
+  tty = (vm.count("tty") > 0);
 
   osflagbits_t flags = 0;
   if (dry_run || vm.count("skip-journal-replay"))
@@ -3387,7 +3391,7 @@ int main(int argc, char **argv)
     usage(desc);
     return 1;
   }
-  outistty = isatty(STDOUT_FILENO);
+  outistty = isatty(STDOUT_FILENO) || tty;
 
   file_fd = fd_none;
   if ((op == "export" || op == "export-remove" || op == "get-osdmap" || op == "get-inc-osdmap") && !dry_run) {
@@ -3518,10 +3522,10 @@ int main(int argc, char **argv)
       return 1;
     }
     if (r > 0) {
-      cerr << "fsck found " << r << " errors" << std::endl;
+      cerr << "fsck status: " << r << " remaining error(s) and warning(s)" << std::endl;
       return 1;
     }
-    cout << "fsck found no errors" << std::endl;
+    cout << "fsck success" << std::endl;
     return 0;
   }
   if (op == "repair" || op == "repair-deep") {
@@ -3531,10 +3535,10 @@ int main(int argc, char **argv)
       return 1;
     }
     if (r > 0) {
-      cerr << "repair found " << r << " errors" << std::endl;
+      cerr << "repair status: " << r << " remaining error(s) and warning(s)" << std::endl;
       return 1;
     }
-    cout << "repair found no errors" << std::endl;
+    cout << "repair success" << std::endl;
     return 0;
   }
   if (op == "mkfs") {
@@ -3756,6 +3760,14 @@ int main(int argc, char **argv)
           ret = 1;
           goto out;
         }
+	if (pgidstr != "meta") {
+	  auto ch = fs->open_collection(coll_t(pgid));
+	  if (!ghobj.match(fs->collection_bits(ch), pgid.ps())) {
+	    stringstream ss;
+	    ss << "object " << ghobj << " not contained by pg " << pgid;
+	    throw std::runtime_error(ss.str());
+	  }
+	}
       }
     } catch (std::runtime_error& e) {
       cerr << e.what() << std::endl;
@@ -3927,6 +3939,21 @@ int main(int argc, char **argv)
     goto out;
   }
 
+  if (op == "statfs") {
+      store_statfs_t statsbuf;
+      ret = fs->statfs(&statsbuf);
+      if (ret < 0) {
+        cerr << "error from statfs: " << cpp_strerror(ret) << std::endl;
+	goto out;
+      }
+      formatter->open_object_section("statfs");
+      statsbuf.dump(formatter);
+      formatter->close_section();
+      formatter->flush(cout);
+      cout << std::endl;
+      goto out;
+  }
+
   if (op == "meta-list") {
     ret = do_meta(fs, object, formatter, debug, human_readable);
     if (ret < 0) {
@@ -3984,7 +4011,7 @@ int main(int argc, char **argv)
   // before complaining about a bad pgid
   if (!vm.count("objcmd") && op != "export" && op != "export-remove" && op != "info" && op != "log" && op != "mark-complete" && op != "trim-pg-log") {
     cerr << "Must provide --op (info, log, remove, mkfs, fsck, repair, export, export-remove, import, list, fix-lost, list-pgs, dump-journal, dump-super, meta-list, "
-      "get-osdmap, set-osdmap, get-inc-osdmap, set-inc-osdmap, mark-complete, reset-last-complete, dump-export, trim-pg-log)"
+      "get-osdmap, set-osdmap, get-inc-osdmap, set-inc-osdmap, mark-complete, reset-last-complete, dump-export, trim-pg-log, statfs)"
 	 << std::endl;
     usage(desc);
     ret = 1;

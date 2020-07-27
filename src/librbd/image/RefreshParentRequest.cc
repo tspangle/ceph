@@ -5,12 +5,12 @@
 #include "include/rados/librados.hpp"
 #include "common/dout.h"
 #include "common/errno.h"
-#include "common/WorkQueue.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/Utils.h"
+#include "librbd/asio/ContextWQ.h"
 #include "librbd/image/CloseRequest.h"
 #include "librbd/image/OpenRequest.h"
-#include "librbd/io/ObjectDispatcher.h"
+#include "librbd/io/ObjectDispatcherInterface.h"
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -36,7 +36,7 @@ template <typename I>
 bool RefreshParentRequest<I>::is_refresh_required(
     I &child_image_ctx, const ParentImageInfo &parent_md,
     const MigrationInfo &migration_info) {
-  ceph_assert(child_image_ctx.image_lock.is_locked());
+  ceph_assert(ceph_mutex_is_locked(child_image_ctx.image_lock));
   return (is_open_required(child_image_ctx, parent_md, migration_info) ||
           is_close_required(child_image_ctx, parent_md, migration_info));
 }
@@ -89,7 +89,7 @@ void RefreshParentRequest<I>::send() {
 
 template <typename I>
 void RefreshParentRequest<I>::apply() {
-  ceph_assert(m_child_image_ctx.image_lock.is_wlocked());
+  ceph_assert(ceph_mutex_is_wlocked(m_child_image_ctx.image_lock));
   std::swap(m_child_image_ctx.parent, m_parent_image_ctx);
 }
 

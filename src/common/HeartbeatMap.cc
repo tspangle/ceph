@@ -12,22 +12,27 @@
  * 
  */
 
+#include <utime.h>
 #include <signal.h>
 
 #include "HeartbeatMap.h"
 #include "ceph_context.h"
 #include "common/errno.h"
+#include "common/valgrind.h"
 #include "debug.h"
 
 #define dout_subsys ceph_subsys_heartbeatmap
 #undef dout_prefix
 #define dout_prefix *_dout << "heartbeat_map "
 
+using std::chrono::duration_cast;
+using std::chrono::seconds;
+using std::string;
+
 namespace ceph {
 
 HeartbeatMap::HeartbeatMap(CephContext *cct)
   : m_cct(cct),
-    m_rwlock("HeartbeatMap::m_rwlock"),
     m_unhealthy_workers(0),
     m_total_workers(0)
 {
@@ -40,7 +45,7 @@ HeartbeatMap::~HeartbeatMap()
 
 heartbeat_handle_d *HeartbeatMap::add_worker(const string& name, pthread_t thread_id)
 {
-  m_rwlock.get_write();
+  std::unique_lock locker{m_rwlock};
   ldout(m_cct, 10) << "add_worker '" << name << "'" << dendl;
   heartbeat_handle_d *h = new heartbeat_handle_d(name);
   ANNOTATE_BENIGN_RACE_SIZED(&h->timeout, sizeof(h->timeout),
@@ -50,16 +55,14 @@ heartbeat_handle_d *HeartbeatMap::add_worker(const string& name, pthread_t threa
   m_workers.push_front(h);
   h->list_item = m_workers.begin();
   h->thread_id = thread_id;
-  m_rwlock.put_write();
   return h;
 }
 
 void HeartbeatMap::remove_worker(const heartbeat_handle_d *h)
 {
-  m_rwlock.get_write();
+  std::unique_lock locker{m_rwlock};
   ldout(m_cct, 10) << "remove_worker '" << h->name << "'" << dendl;
   m_workers.erase(h->list_item);
-  m_rwlock.put_write();
   delete h;
 }
 
@@ -90,8 +93,8 @@ void HeartbeatMap::reset_timeout(heartbeat_handle_d *h,
 {
   ldout(m_cct, 20) << "reset_timeout '" << h->name << "' grace " << grace
 		   << " suicide " << suicide_grace << dendl;
-  auto now = chrono::duration_cast<chrono::seconds>(
-	       ceph::coarse_mono_clock::now().time_since_epoch()).count();
+  auto now = duration_cast<seconds>(coarse_mono_clock::now()
+				    .time_since_epoch()).count();
   _check(h, "reset_timeout", now);
 
   h->timeout = now + grace;
@@ -107,8 +110,8 @@ void HeartbeatMap::reset_timeout(heartbeat_handle_d *h,
 void HeartbeatMap::clear_timeout(heartbeat_handle_d *h)
 {
   ldout(m_cct, 20) << "clear_timeout '" << h->name << "'" << dendl;
-  auto now = chrono::duration_cast<std::chrono::seconds>(
-	       ceph::coarse_mono_clock::now().time_since_epoch()).count();
+  auto now = duration_cast<seconds>(coarse_mono_clock::now()
+				    .time_since_epoch()).count();
   _check(h, "clear_timeout", now);
   h->timeout = 0;
   h->suicide_timeout = 0;
@@ -118,7 +121,7 @@ bool HeartbeatMap::is_healthy()
 {
   int unhealthy = 0;
   int total = 0;
-  m_rwlock.get_read();
+  m_rwlock.lock_shared();
   auto now = ceph::coarse_mono_clock::now();
   if (m_cct->_conf->heartbeat_inject_failure) {
     ldout(m_cct, 0) << "is_healthy injecting failure for next " << m_cct->_conf->heartbeat_inject_failure << " seconds" << dendl;
@@ -134,18 +137,18 @@ bool HeartbeatMap::is_healthy()
     healthy = false;
   }
 
-  for (list<heartbeat_handle_d*>::iterator p = m_workers.begin();
+  for (auto p = m_workers.begin();
        p != m_workers.end();
        ++p) {
     heartbeat_handle_d *h = *p;
-    auto epoch = chrono::duration_cast<chrono::seconds>(now.time_since_epoch()).count();
+    auto epoch = duration_cast<seconds>(now.time_since_epoch()).count();
     if (!_check(h, "is_healthy", epoch)) {
       healthy = false;
       unhealthy++;
     }
     total++;
   }
-  m_rwlock.put_read();
+  m_rwlock.unlock_shared();
 
   m_unhealthy_workers = unhealthy;
   m_total_workers = total;
@@ -171,7 +174,7 @@ void HeartbeatMap::check_touch_file()
   if (path.length() && is_healthy()) {
     int fd = ::open(path.c_str(), O_WRONLY|O_CREAT|O_CLOEXEC, 0644);
     if (fd >= 0) {
-      ::utimes(path.c_str(), NULL);
+      ::utime(path.c_str(), NULL);
       ::close(fd);
     } else {
       ldout(m_cct, 0) << "unable to touch " << path << ": "

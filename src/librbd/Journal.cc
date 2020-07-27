@@ -3,6 +3,7 @@
 
 #include "librbd/Journal.h"
 #include "include/rados/librados.hpp"
+#include "common/AsyncOpTracker.h"
 #include "common/errno.h"
 #include "common/Timer.h"
 #include "common/WorkQueue.h"
@@ -12,11 +13,10 @@
 #include "journal/ReplayEntry.h"
 #include "journal/Settings.h"
 #include "journal/Utils.h"
-#include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
-#include "librbd/io/ImageRequestWQ.h"
+#include "librbd/asio/ContextWQ.h"
 #include "librbd/io/ObjectDispatchSpec.h"
-#include "librbd/io/ObjectDispatcher.h"
+#include "librbd/io/ObjectDispatcherInterface.h"
 #include "librbd/journal/CreateRequest.h"
 #include "librbd/journal/DemoteRequest.h"
 #include "librbd/journal/ObjectDispatch.h"
@@ -42,15 +42,23 @@ using journal::util::C_DecodeTags;
 
 namespace {
 
-// TODO: once journaler is 100% async, remove separate threads and
-// reuse ImageCtx's thread pool
+// TODO: once journaler is 100% async and converted to ASIO, remove separate
+// threads and reuse librbd's AsioEngine
 class ThreadPoolSingleton : public ThreadPool {
 public:
+  ContextWQ *work_queue;
+
   explicit ThreadPoolSingleton(CephContext *cct)
-    : ThreadPool(cct, "librbd::Journal", "tp_librbd_journ", 1) {
+    : ThreadPool(cct, "librbd::Journal", "tp_librbd_journ", 1),
+      work_queue(new ContextWQ("librbd::journal::work_queue",
+                               cct->_conf.get_val<uint64_t>("rbd_op_thread_timeout"),
+                               this)) {
     start();
   }
   ~ThreadPoolSingleton() override {
+    work_queue->drain();
+    delete work_queue;
+
     stop();
   }
 };
@@ -60,7 +68,7 @@ struct C_IsTagOwner : public Context {
   librados::IoCtx &io_ctx;
   std::string image_id;
   bool *is_tag_owner;
-  ContextWQ *op_work_queue;
+  asio::ContextWQ *op_work_queue;
   Context *on_finish;
 
   CephContext *cct = nullptr;
@@ -71,7 +79,8 @@ struct C_IsTagOwner : public Context {
   journal::TagData tag_data;
 
   C_IsTagOwner(librados::IoCtx &io_ctx, const std::string &image_id,
-               bool *is_tag_owner, ContextWQ *op_work_queue, Context *on_finish)
+               bool *is_tag_owner, asio::ContextWQ *op_work_queue,
+               Context *on_finish)
     : io_ctx(io_ctx), image_id(image_id), is_tag_owner(is_tag_owner),
       op_work_queue(op_work_queue), on_finish(on_finish),
       cct(reinterpret_cast<CephContext*>(io_ctx.cct())),
@@ -91,7 +100,7 @@ struct C_IsTagOwner : public Context {
 
     Journaler *journaler = this->journaler;
     Context *on_finish = this->on_finish;
-    FunctionContext *ctx = new FunctionContext(
+    auto ctx = new LambdaContext(
       [journaler, on_finish](int r) {
 	on_finish->complete(r);
 	delete journaler;
@@ -134,13 +143,13 @@ struct GetTagsRequest {
   journal::TagData *tag_data;
   Context *on_finish;
 
-  Mutex lock;
+  ceph::mutex lock = ceph::make_mutex("lock");
 
   GetTagsRequest(CephContext *cct, J *journaler, cls::journal::Client *client,
                  journal::ImageClientMeta *client_meta, uint64_t *tag_tid,
                  journal::TagData *tag_data, Context *on_finish)
     : cct(cct), journaler(journaler), client(client), client_meta(client_meta),
-      tag_tid(tag_tid), tag_data(tag_data), on_finish(on_finish), lock("lock") {
+      tag_tid(tag_tid), tag_data(tag_data), on_finish(on_finish) {
   }
 
   /**
@@ -167,7 +176,7 @@ struct GetTagsRequest {
   void send_get_client() {
     ldout(cct, 20) << __func__ << dendl;
 
-    FunctionContext *ctx = new FunctionContext(
+    auto ctx = new LambdaContext(
       [this](int r) {
         handle_get_client(r);
       });
@@ -209,7 +218,7 @@ struct GetTagsRequest {
   void send_get_tags() {
     ldout(cct, 20) << __func__ << dendl;
 
-    FunctionContext *ctx = new FunctionContext(
+    auto ctx = new LambdaContext(
       [this](int r) {
         handle_get_tags(r);
       });
@@ -324,24 +333,38 @@ std::ostream &operator<<(std::ostream &os,
   return os;
 }
 
+
+template <typename I>
+void Journal<I>::MetadataListener::handle_update(::journal::JournalMetadata *) {
+  auto ctx = new LambdaContext([this](int r) {
+    journal->handle_metadata_updated();
+  });
+  journal->m_work_queue->queue(ctx, 0);
+}
+
+
+template <typename I>
+void Journal<I>::get_work_queue(CephContext *cct, ContextWQ **work_queue) {
+  auto thread_pool_singleton =
+    &cct->lookup_or_create_singleton_object<ThreadPoolSingleton>(
+      "librbd::journal::thread_pool", false, cct);
+  *work_queue = thread_pool_singleton->work_queue;
+}
+
 template <typename I>
 Journal<I>::Journal(I &image_ctx)
-  : m_image_ctx(image_ctx), m_journaler(NULL),
-    m_lock("Journal<I>::m_lock"), m_state(STATE_UNINITIALIZED),
+  : RefCountedObject(image_ctx.cct),
+    m_image_ctx(image_ctx), m_journaler(NULL),
+    m_state(STATE_UNINITIALIZED),
     m_error_result(0), m_replay_handler(this), m_close_pending(false),
-    m_event_lock("Journal<I>::m_event_lock"), m_event_tid(0),
+    m_event_tid(0),
     m_blocking_writes(false), m_journal_replay(NULL),
     m_metadata_listener(this) {
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 5) << this << ": ictx=" << &m_image_ctx << dendl;
 
-  auto thread_pool_singleton =
-    &cct->lookup_or_create_singleton_object<ThreadPoolSingleton>(
-      "librbd::journal::thread_pool", false, cct);
-  m_work_queue = new ContextWQ("librbd::journal::work_queue",
-                               cct->_conf.get_val<uint64_t>("rbd_op_thread_timeout"),
-                               thread_pool_singleton);
+  get_work_queue(cct, &m_work_queue);
   ImageCtx::get_timer_instance(cct, &m_timer, &m_timer_lock);
 }
 
@@ -349,9 +372,9 @@ template <typename I>
 Journal<I>::~Journal() {
   if (m_work_queue != nullptr) {
     m_work_queue->drain();
-    delete m_work_queue;
   }
 
+  std::lock_guard locker{m_lock};
   ceph_assert(m_state == STATE_UNINITIALIZED || m_state == STATE_CLOSED);
   ceph_assert(m_journaler == NULL);
   ceph_assert(m_journal_replay == NULL);
@@ -360,7 +383,7 @@ Journal<I>::~Journal() {
 
 template <typename I>
 bool Journal<I>::is_journal_supported(I &image_ctx) {
-  ceph_assert(image_ctx.image_lock.is_locked());
+  ceph_assert(ceph_mutex_is_locked(image_ctx.image_lock));
   return ((image_ctx.features & RBD_FEATURE_JOURNALING) &&
           !image_ctx.read_only && image_ctx.snap_id == CEPH_NOSNAP);
 }
@@ -372,15 +395,14 @@ int Journal<I>::create(librados::IoCtx &io_ctx, const std::string &image_id,
   CephContext *cct = reinterpret_cast<CephContext *>(io_ctx.cct());
   ldout(cct, 5) << __func__ << ": image=" << image_id << dendl;
 
-  ThreadPool *thread_pool;
-  ContextWQ *op_work_queue;
-  ImageCtx::get_thread_pool_instance(cct, &thread_pool, &op_work_queue);
+  ContextWQ *work_queue;
+  get_work_queue(cct, &work_queue);
 
   C_SaferCond cond;
   journal::TagData tag_data(LOCAL_MIRROR_UUID);
   journal::CreateRequest<I> *req = journal::CreateRequest<I>::create(
     io_ctx, image_id, order, splay_width, object_pool, cls::journal::Tag::TAG_CLASS_NEW,
-    tag_data, IMAGE_CLIENT_ID, op_work_queue, &cond);
+    tag_data, IMAGE_CLIENT_ID, work_queue, &cond);
   req->send();
 
   return cond.wait();
@@ -391,13 +413,12 @@ int Journal<I>::remove(librados::IoCtx &io_ctx, const std::string &image_id) {
   CephContext *cct = reinterpret_cast<CephContext *>(io_ctx.cct());
   ldout(cct, 5) << __func__ << ": image=" << image_id << dendl;
 
-  ThreadPool *thread_pool;
-  ContextWQ *op_work_queue;
-  ImageCtx::get_thread_pool_instance(cct, &thread_pool, &op_work_queue);
+  ContextWQ *work_queue;
+  get_work_queue(cct, &work_queue);
 
   C_SaferCond cond;
   journal::RemoveRequest<I> *req = journal::RemoveRequest<I>::create(
-    io_ctx, image_id, IMAGE_CLIENT_ID, op_work_queue, &cond);
+    io_ctx, image_id, IMAGE_CLIENT_ID, work_queue, &cond);
   req->send();
 
   return cond.wait();
@@ -408,14 +429,13 @@ int Journal<I>::reset(librados::IoCtx &io_ctx, const std::string &image_id) {
   CephContext *cct = reinterpret_cast<CephContext *>(io_ctx.cct());
   ldout(cct, 5) << __func__ << ": image=" << image_id << dendl;
 
-  ThreadPool *thread_pool;
-  ContextWQ *op_work_queue;
-  ImageCtx::get_thread_pool_instance(cct, &thread_pool, &op_work_queue);
+  ContextWQ *work_queue;
+  get_work_queue(cct, &work_queue);
 
   C_SaferCond cond;
   auto req = journal::ResetRequest<I>::create(io_ctx, image_id, IMAGE_CLIENT_ID,
                                               Journal<>::LOCAL_MIRROR_UUID,
-                                              op_work_queue, &cond);
+                                              work_queue, &cond);
   req->send();
 
   return cond.wait();
@@ -430,7 +450,8 @@ void Journal<I>::is_tag_owner(I *image_ctx, bool *owner,
 
 template <typename I>
 void Journal<I>::is_tag_owner(librados::IoCtx& io_ctx, std::string& image_id,
-                              bool *is_tag_owner, ContextWQ *op_work_queue,
+                              bool *is_tag_owner,
+                              asio::ContextWQ *op_work_queue,
                               Context *on_finish) {
   CephContext *cct = reinterpret_cast<CephContext*>(io_ctx.cct());
   ldout(cct, 20) << __func__ << dendl;
@@ -445,7 +466,8 @@ void Journal<I>::is_tag_owner(librados::IoCtx& io_ctx, std::string& image_id,
 template <typename I>
 void Journal<I>::get_tag_owner(IoCtx& io_ctx, std::string& image_id,
                                std::string *mirror_uuid,
-                               ContextWQ *op_work_queue, Context *on_finish) {
+                               asio::ContextWQ *op_work_queue,
+                               Context *on_finish) {
   CephContext *cct = static_cast<CephContext *>(io_ctx.cct());
   ldout(cct, 20) << __func__ << dendl;
 
@@ -462,7 +484,7 @@ int Journal<I>::request_resync(I *image_ctx) {
   Journaler journaler(image_ctx->md_ctx, image_ctx->id, IMAGE_CLIENT_ID, {},
                       nullptr);
 
-  Mutex lock("lock");
+  ceph::mutex lock = ceph::make_mutex("lock");
   journal::ImageClientMeta client_meta;
   uint64_t tag_tid;
   journal::TagData tag_data;
@@ -521,19 +543,19 @@ void Journal<I>::demote(I *image_ctx, Context *on_finish) {
 
 template <typename I>
 bool Journal<I>::is_journal_ready() const {
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   return (m_state == STATE_READY);
 }
 
 template <typename I>
 bool Journal<I>::is_journal_replaying() const {
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   return is_journal_replaying(m_lock);
 }
 
 template <typename I>
-bool Journal<I>::is_journal_replaying(const Mutex &) const {
-  ceph_assert(m_lock.is_locked());
+bool Journal<I>::is_journal_replaying(const ceph::mutex &) const {
+  ceph_assert(ceph_mutex_is_locked(m_lock));
   return (m_state == STATE_REPLAYING ||
           m_state == STATE_FLUSHING_REPLAY ||
           m_state == STATE_FLUSHING_RESTART ||
@@ -542,8 +564,8 @@ bool Journal<I>::is_journal_replaying(const Mutex &) const {
 
 template <typename I>
 bool Journal<I>::is_journal_appending() const {
-  ceph_assert(m_image_ctx.image_lock.is_locked());
-  Mutex::Locker locker(m_lock);
+  ceph_assert(ceph_mutex_is_locked(m_image_ctx.image_lock));
+  std::lock_guard locker{m_lock};
   return (m_state == STATE_READY &&
           !m_image_ctx.get_journal_policy()->append_disabled());
 }
@@ -552,7 +574,7 @@ template <typename I>
 void Journal<I>::wait_for_journal_ready(Context *on_ready) {
   on_ready = create_async_context_callback(m_image_ctx, on_ready);
 
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   if (m_state == STATE_READY) {
     on_ready->complete(m_error_result);
   } else {
@@ -565,13 +587,15 @@ void Journal<I>::open(Context *on_finish) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << dendl;
 
+  on_finish = create_context_callback<Context>(on_finish, this);
+
   on_finish = create_async_context_callback(m_image_ctx, on_finish);
 
   // inject our handler into the object dispatcher chain
-  m_image_ctx.io_object_dispatcher->register_object_dispatch(
+  m_image_ctx.io_object_dispatcher->register_dispatch(
     journal::ObjectDispatch<I>::create(&m_image_ctx, this));
 
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   ceph_assert(m_state == STATE_UNINITIALIZED);
   wait_for_steady_state(on_finish);
   create_journaler();
@@ -582,31 +606,31 @@ void Journal<I>::close(Context *on_finish) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << dendl;
 
-  on_finish = new FunctionContext([this, on_finish](int r) {
+  on_finish = create_context_callback<Context>(on_finish, this);
+
+  on_finish = new LambdaContext([this, on_finish](int r) {
       // remove our handler from object dispatcher chain - preserve error
-      auto ctx = new FunctionContext([on_finish, r](int _) {
+      auto ctx = new LambdaContext([on_finish, r](int _) {
           on_finish->complete(r);
         });
-      m_image_ctx.io_object_dispatcher->shut_down_object_dispatch(
+      m_image_ctx.io_object_dispatcher->shut_down_dispatch(
         io::OBJECT_DISPATCH_LAYER_JOURNAL, ctx);
     });
   on_finish = create_async_context_callback(m_image_ctx, on_finish);
 
-  Mutex::Locker locker(m_lock);
-  while (m_listener_notify) {
-    m_listener_cond.Wait(m_lock);
-  }
+  std::unique_lock locker{m_lock};
+  m_listener_cond.wait(locker, [this] { return !m_listener_notify; });
 
   Listeners listeners(m_listeners);
   m_listener_notify = true;
-  m_lock.Unlock();
+  locker.unlock();
   for (auto listener : listeners) {
     listener->handle_close();
   }
 
-  m_lock.Lock();
+  locker.lock();
   m_listener_notify = false;
-  m_listener_cond.Signal();
+  m_listener_cond.notify_all();
 
   ceph_assert(m_state != STATE_UNINITIALIZED);
   if (m_state == STATE_CLOSED) {
@@ -624,25 +648,25 @@ void Journal<I>::close(Context *on_finish) {
 
 template <typename I>
 bool Journal<I>::is_tag_owner() const {
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   return is_tag_owner(m_lock);
 }
 
 template <typename I>
-bool Journal<I>::is_tag_owner(const Mutex &) const {
-  ceph_assert(m_lock.is_locked());
+bool Journal<I>::is_tag_owner(const ceph::mutex &) const {
+  ceph_assert(ceph_mutex_is_locked(m_lock));
   return (m_tag_data.mirror_uuid == LOCAL_MIRROR_UUID);
 }
 
 template <typename I>
 uint64_t Journal<I>::get_tag_tid() const {
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   return m_tag_tid;
 }
 
 template <typename I>
 journal::TagData Journal<I>::get_tag_data() const {
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   return m_tag_data;
 }
 
@@ -654,7 +678,7 @@ void Journal<I>::allocate_local_tag(Context *on_finish) {
   journal::TagPredecessor predecessor;
   predecessor.mirror_uuid = LOCAL_MIRROR_UUID;
   {
-    Mutex::Locker locker(m_lock);
+    std::lock_guard locker{m_lock};
     ceph_assert(m_journaler != nullptr && is_tag_owner(m_lock));
 
     cls::journal::Client client;
@@ -688,7 +712,7 @@ void Journal<I>::allocate_tag(const std::string &mirror_uuid,
   ldout(cct, 20) << this << " " << __func__ << ":  mirror_uuid=" << mirror_uuid
                  << dendl;
 
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   ceph_assert(m_journaler != nullptr);
 
   journal::TagData tag_data;
@@ -709,7 +733,7 @@ void Journal<I>::flush_commit_position(Context *on_finish) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << dendl;
 
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   ceph_assert(m_journaler != nullptr);
   m_journaler->flush_commit_position(on_finish);
 }
@@ -718,7 +742,7 @@ template <typename I>
 void Journal<I>::user_flushed() {
   if (m_state == STATE_READY && !m_user_flushed.exchange(true) &&
       m_image_ctx.config.template get_val<bool>("rbd_journal_object_writethrough_until_flush")) {
-    Mutex::Locker locker(m_lock);
+    std::lock_guard locker{m_lock};
     if (m_state == STATE_READY) {
       CephContext *cct = m_image_ctx.cct;
       ldout(cct, 5) << this << " " << __func__ << dendl;
@@ -787,7 +811,7 @@ uint64_t Journal<I>::append_io_events(journal::EventType event_type,
 
   uint64_t tid;
   {
-    Mutex::Locker locker(m_lock);
+    std::lock_guard locker{m_lock};
     ceph_assert(m_state == STATE_READY);
 
     tid = ++m_event_tid;
@@ -801,7 +825,7 @@ uint64_t Journal<I>::append_io_events(journal::EventType event_type,
   }
 
   {
-    Mutex::Locker event_locker(m_event_lock);
+    std::lock_guard event_locker{m_event_lock};
     m_events[tid] = Event(futures, offset, length, filter_ret_val);
   }
 
@@ -829,7 +853,7 @@ void Journal<I>::commit_io_event(uint64_t tid, int r) {
   ldout(cct, 20) << this << " " << __func__ << ": tid=" << tid << ", "
                  "r=" << r << dendl;
 
-  Mutex::Locker event_locker(m_event_lock);
+  std::lock_guard event_locker{m_event_lock};
   typename Events::iterator it = m_events.find(tid);
   if (it == m_events.end()) {
     return;
@@ -848,7 +872,7 @@ void Journal<I>::commit_io_event_extent(uint64_t tid, uint64_t offset,
                  << "length=" << length << ", "
                  << "r=" << r << dendl;
 
-  Mutex::Locker event_locker(m_event_lock);
+  std::lock_guard event_locker{m_event_lock};
   typename Events::iterator it = m_events.find(tid);
   if (it == m_events.end()) {
     return;
@@ -878,7 +902,7 @@ template <typename I>
 void Journal<I>::append_op_event(uint64_t op_tid,
                                  journal::EventEntry &&event_entry,
                                  Context *on_safe) {
-  ceph_assert(m_image_ctx.owner_lock.is_locked());
+  ceph_assert(ceph_mutex_is_locked(m_image_ctx.owner_lock));
 
   bufferlist bl;
   event_entry.timestamp = ceph_clock_now();
@@ -886,7 +910,7 @@ void Journal<I>::append_op_event(uint64_t op_tid,
 
   Future future;
   {
-    Mutex::Locker locker(m_lock);
+    std::lock_guard locker{m_lock};
     ceph_assert(m_state == STATE_READY);
 
     future = m_journaler->append(m_tag_tid, bl);
@@ -897,7 +921,7 @@ void Journal<I>::append_op_event(uint64_t op_tid,
   }
 
   on_safe = create_async_context_callback(m_image_ctx, on_safe);
-  on_safe = new FunctionContext([this, on_safe](int r) {
+  on_safe = new LambdaContext([this, on_safe](int r) {
       // ensure all committed IO before this op is committed
       m_journaler->flush_commit_position(on_safe);
     });
@@ -924,7 +948,7 @@ void Journal<I>::commit_op_event(uint64_t op_tid, int r, Context *on_safe) {
   Future op_start_future;
   Future op_finish_future;
   {
-    Mutex::Locker locker(m_lock);
+    std::lock_guard locker{m_lock};
     ceph_assert(m_state == STATE_READY);
 
     // ready to commit op event
@@ -947,7 +971,7 @@ void Journal<I>::replay_op_ready(uint64_t op_tid, Context *on_resume) {
   ldout(cct, 10) << this << " " << __func__ << ": op_tid=" << op_tid << dendl;
 
   {
-    Mutex::Locker locker(m_lock);
+    std::lock_guard locker{m_lock};
     ceph_assert(m_journal_replay != nullptr);
     m_journal_replay->replay_op_ready(op_tid, on_resume);
   }
@@ -959,9 +983,11 @@ void Journal<I>::flush_event(uint64_t tid, Context *on_safe) {
   ldout(cct, 20) << this << " " << __func__ << ": tid=" << tid << ", "
                  << "on_safe=" << on_safe << dendl;
 
+  on_safe = create_context_callback<Context>(on_safe, this);
+
   Future future;
   {
-    Mutex::Locker event_locker(m_event_lock);
+    std::lock_guard event_locker{m_event_lock};
     future = wait_event(m_lock, tid, on_safe);
   }
 
@@ -976,14 +1002,16 @@ void Journal<I>::wait_event(uint64_t tid, Context *on_safe) {
   ldout(cct, 20) << this << " " << __func__ << ": tid=" << tid << ", "
                  << "on_safe=" << on_safe << dendl;
 
-  Mutex::Locker event_locker(m_event_lock);
+  on_safe = create_context_callback<Context>(on_safe, this);
+
+  std::lock_guard event_locker{m_event_lock};
   wait_event(m_lock, tid, on_safe);
 }
 
 template <typename I>
-typename Journal<I>::Future Journal<I>::wait_event(Mutex &lock, uint64_t tid,
+typename Journal<I>::Future Journal<I>::wait_event(ceph::mutex &lock, uint64_t tid,
                                                    Context *on_safe) {
-  ceph_assert(m_event_lock.is_locked());
+  ceph_assert(ceph_mutex_is_locked(m_event_lock));
   CephContext *cct = m_image_ctx.cct;
 
   typename Events::iterator it = m_events.find(tid);
@@ -1009,12 +1037,12 @@ void Journal<I>::start_external_replay(journal::Replay<I> **journal_replay,
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << dendl;
 
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   ceph_assert(m_state == STATE_READY);
   ceph_assert(m_journal_replay == nullptr);
 
   on_start = util::create_async_context_callback(m_image_ctx, on_start);
-  on_start = new FunctionContext(
+  on_start = new LambdaContext(
     [this, journal_replay, on_start](int r) {
       handle_start_external_replay(r, journal_replay, on_start);
     });
@@ -1031,7 +1059,7 @@ void Journal<I>::handle_start_external_replay(int r,
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << dendl;
 
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   ceph_assert(m_state == STATE_READY);
   ceph_assert(m_journal_replay == nullptr);
 
@@ -1057,7 +1085,7 @@ void Journal<I>::stop_external_replay() {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << dendl;
 
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   ceph_assert(m_journal_replay != nullptr);
   ceph_assert(m_state == STATE_REPLAYING);
 
@@ -1077,7 +1105,7 @@ void Journal<I>::create_journaler() {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << dendl;
 
-  ceph_assert(m_lock.is_locked());
+  ceph_assert(ceph_mutex_is_locked(m_lock));
   ceph_assert(m_state == STATE_UNINITIALIZED || m_state == STATE_RESTARTING_REPLAY);
   ceph_assert(m_journaler == NULL);
 
@@ -1112,7 +1140,7 @@ void Journal<I>::destroy_journaler(int r) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << ": r=" << r << dendl;
 
-  ceph_assert(m_lock.is_locked());
+  ceph_assert(ceph_mutex_is_locked(m_lock));
 
   delete m_journal_replay;
   m_journal_replay = NULL;
@@ -1124,12 +1152,13 @@ void Journal<I>::destroy_journaler(int r) {
   Context *ctx = create_async_context_callback(
     m_image_ctx, create_context_callback<
       Journal<I>, &Journal<I>::handle_journal_destroyed>(this));
-  ctx = new FunctionContext(
+  ctx = new LambdaContext(
     [this, ctx](int r) {
-      Mutex::Locker locker(m_lock);
+      std::lock_guard locker{m_lock};
       m_journaler->shut_down(ctx);
     });
-  m_async_journal_op_tracker.wait(m_image_ctx, ctx);
+  ctx = create_async_context_callback(m_image_ctx, ctx);
+  m_async_journal_op_tracker.wait_for_ops(ctx);
 }
 
 template <typename I>
@@ -1137,7 +1166,7 @@ void Journal<I>::recreate_journaler(int r) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << ": r=" << r << dendl;
 
-  ceph_assert(m_lock.is_locked());
+  ceph_assert(ceph_mutex_is_locked(m_lock));
   ceph_assert(m_state == STATE_FLUSHING_RESTART ||
               m_state == STATE_FLUSHING_REPLAY);
 
@@ -1154,7 +1183,7 @@ void Journal<I>::recreate_journaler(int r) {
 
 template <typename I>
 void Journal<I>::complete_event(typename Events::iterator it, int r) {
-  ceph_assert(m_event_lock.is_locked());
+  ceph_assert(ceph_mutex_is_locked(m_event_lock));
   ceph_assert(m_state == STATE_READY);
 
   CephContext *cct = m_image_ctx.cct;
@@ -1188,7 +1217,7 @@ void Journal<I>::complete_event(typename Events::iterator it, int r) {
 
 template <typename I>
 void Journal<I>::start_append() {
-  ceph_assert(m_lock.is_locked());
+  ceph_assert(ceph_mutex_is_locked(m_lock));
 
   m_journaler->start_append(
     m_image_ctx.config.template get_val<uint64_t>("rbd_journal_object_max_in_flight_appends"));
@@ -1207,7 +1236,7 @@ void Journal<I>::handle_open(int r) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << ": r=" << r << dendl;
 
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   ceph_assert(m_state == STATE_INITIALIZING);
 
   if (r < 0) {
@@ -1234,7 +1263,7 @@ void Journal<I>::handle_replay_ready() {
   CephContext *cct = m_image_ctx.cct;
   ReplayEntry replay_entry;
   {
-    Mutex::Locker locker(m_lock);
+    std::lock_guard locker{m_lock};
     if (m_state != STATE_REPLAYING) {
       return;
     }
@@ -1248,6 +1277,8 @@ void Journal<I>::handle_replay_ready() {
     ceph_assert(!m_processing_entry);
     m_processing_entry = true;
   }
+
+  m_async_journal_op_tracker.start_op();
 
   bufferlist data = replay_entry.get_data();
   auto it = data.cbegin();
@@ -1273,7 +1304,7 @@ void Journal<I>::handle_replay_complete(int r) {
 
   bool cancel_ops = false;
   {
-    Mutex::Locker locker(m_lock);
+    std::lock_guard locker{m_lock};
     if (m_state != STATE_REPLAYING) {
       return;
     }
@@ -1288,13 +1319,13 @@ void Journal<I>::handle_replay_complete(int r) {
     }
   }
 
-  Context *ctx = new FunctionContext([this, cct](int r) {
+  Context *ctx = new LambdaContext([this, cct](int r) {
       ldout(cct, 20) << this << " handle_replay_complete: "
                      << "handle shut down replay" << dendl;
 
       State state;
       {
-        Mutex::Locker locker(m_lock);
+	std::lock_guard locker{m_lock};
         ceph_assert(m_state == STATE_FLUSHING_RESTART ||
                     m_state == STATE_FLUSHING_REPLAY);
         state = m_state;
@@ -1306,15 +1337,20 @@ void Journal<I>::handle_replay_complete(int r) {
         handle_flushing_replay();
       }
     });
-  ctx = new FunctionContext([this, ctx](int r) {
+  ctx = new LambdaContext([this, ctx](int r) {
       // ensure the commit position is flushed to disk
       m_journaler->flush_commit_position(ctx);
     });
-  ctx = new FunctionContext([this, cct, cancel_ops, ctx](int r) {
+  ctx = create_async_context_callback(m_image_ctx, ctx);
+  ctx = new LambdaContext([this, ctx](int r) {
+      m_async_journal_op_tracker.wait_for_ops(ctx);
+    });
+  ctx = new LambdaContext([this, cct, cancel_ops, ctx](int r) {
       ldout(cct, 20) << this << " handle_replay_complete: "
                      << "shut down replay" << dendl;
       m_journal_replay->shut_down(cancel_ops, ctx);
     });
+
   m_journaler->stop_replay(ctx);
 }
 
@@ -1326,7 +1362,7 @@ void Journal<I>::handle_replay_process_ready(int r) {
 
   ceph_assert(r == 0);
   {
-    Mutex::Locker locker(m_lock);
+    std::lock_guard locker{m_lock};
     ceph_assert(m_processing_entry);
     m_processing_entry = false;
   }
@@ -1337,7 +1373,7 @@ template <typename I>
 void Journal<I>::handle_replay_process_safe(ReplayEntry replay_entry, int r) {
   CephContext *cct = m_image_ctx.cct;
 
-  m_lock.Lock();
+  std::unique_lock locker{m_lock};
   ceph_assert(m_state == STATE_REPLAYING ||
               m_state == STATE_FLUSHING_RESTART ||
               m_state == STATE_FLUSHING_REPLAY);
@@ -1353,43 +1389,46 @@ void Journal<I>::handle_replay_process_safe(ReplayEntry replay_entry, int r) {
     if (m_state == STATE_REPLAYING) {
       // abort the replay if we have an error
       transition_state(STATE_FLUSHING_RESTART, r);
-      m_lock.Unlock();
+      locker.unlock();
 
       // stop replay, shut down, and restart
       Context* ctx = create_context_callback<
         Journal<I>, &Journal<I>::handle_flushing_restart>(this);
-      ctx = new FunctionContext([this, ctx](int r) {
+      ctx = new LambdaContext([this, ctx](int r) {
           // ensure the commit position is flushed to disk
           m_journaler->flush_commit_position(ctx);
         });
-      ctx = new FunctionContext([this, cct, ctx](int r) {
+      ctx = new LambdaContext([this, cct, ctx](int r) {
           ldout(cct, 20) << this << " handle_replay_process_safe: "
                          << "shut down replay" << dendl;
           {
-            Mutex::Locker locker(m_lock);
+	    std::lock_guard locker{m_lock};
             ceph_assert(m_state == STATE_FLUSHING_RESTART);
           }
 
           m_journal_replay->shut_down(true, ctx);
         });
       m_journaler->stop_replay(ctx);
+      m_async_journal_op_tracker.finish_op();
       return;
     } else if (m_state == STATE_FLUSHING_REPLAY) {
       // end-of-replay flush in-progress -- we need to restart replay
       transition_state(STATE_FLUSHING_RESTART, r);
-      m_lock.Unlock();
+      locker.unlock();
+      m_async_journal_op_tracker.finish_op();
       return;
     }
   } else {
     // only commit the entry if written successfully
     m_journaler->committed(replay_entry);
   }
-  m_lock.Unlock();
+  locker.unlock();
+  m_async_journal_op_tracker.finish_op();
 }
 
 template <typename I>
 void Journal<I>::handle_flushing_restart(int r) {
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << dendl;
@@ -1406,7 +1445,7 @@ void Journal<I>::handle_flushing_restart(int r) {
 
 template <typename I>
 void Journal<I>::handle_flushing_replay() {
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << dendl;
@@ -1434,7 +1473,7 @@ void Journal<I>::handle_recording_stopped(int r) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << ": r=" << r << dendl;
 
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   ceph_assert(m_state == STATE_STOPPING);
 
   destroy_journaler(r);
@@ -1451,7 +1490,7 @@ void Journal<I>::handle_journal_destroyed(int r) {
                << dendl;
   }
 
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   delete m_journaler;
   m_journaler = nullptr;
 
@@ -1479,7 +1518,7 @@ void Journal<I>::handle_io_event_safe(int r, uint64_t tid) {
 
   Contexts on_safe_contexts;
   {
-    Mutex::Locker event_locker(m_event_lock);
+    std::lock_guard event_locker{m_event_lock};
     typename Events::iterator it = m_events.find(tid);
     ceph_assert(it != m_events.end());
 
@@ -1537,7 +1576,7 @@ void Journal<I>::handle_op_event_safe(int r, uint64_t tid,
 
 template <typename I>
 void Journal<I>::stop_recording() {
-  ceph_assert(m_lock.is_locked());
+  ceph_assert(ceph_mutex_is_locked(m_lock));
   ceph_assert(m_journaler != NULL);
 
   ceph_assert(m_state == STATE_READY);
@@ -1552,7 +1591,7 @@ template <typename I>
 void Journal<I>::transition_state(State state, int r) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << ": new state=" << state << dendl;
-  ceph_assert(m_lock.is_locked());
+  ceph_assert(ceph_mutex_is_locked(m_lock));
   m_state = state;
 
   if (m_error_result == 0 && r < 0) {
@@ -1569,7 +1608,7 @@ void Journal<I>::transition_state(State state, int r) {
 
 template <typename I>
 bool Journal<I>::is_steady_state() const {
-  ceph_assert(m_lock.is_locked());
+  ceph_assert(ceph_mutex_is_locked(m_lock));
   switch (m_state) {
   case STATE_READY:
   case STATE_CLOSED:
@@ -1589,7 +1628,7 @@ bool Journal<I>::is_steady_state() const {
 
 template <typename I>
 void Journal<I>::wait_for_steady_state(Context *on_state) {
-  ceph_assert(m_lock.is_locked());
+  ceph_assert(ceph_mutex_is_locked(m_lock));
   ceph_assert(!is_steady_state());
 
   CephContext *cct = m_image_ctx.cct;
@@ -1600,7 +1639,7 @@ void Journal<I>::wait_for_steady_state(Context *on_state) {
 
 template <typename I>
 int Journal<I>::is_resync_requested(bool *do_resync) {
-  Mutex::Locker l(m_lock);
+  std::lock_guard l{m_lock};
   return check_resync_requested(do_resync);
 }
 
@@ -1609,7 +1648,7 @@ int Journal<I>::check_resync_requested(bool *do_resync) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << dendl;
 
-  ceph_assert(m_lock.is_locked());
+  ceph_assert(ceph_mutex_is_locked(m_lock));
   ceph_assert(do_resync != nullptr);
 
   cls::journal::Client client;
@@ -1626,7 +1665,7 @@ int Journal<I>::check_resync_requested(bool *do_resync) {
     decode(client_data, bl_it);
   } catch (const buffer::error &err) {
     lderr(cct) << this << " " << __func__ << ": "
-               << "failed to decode client data: " << err << dendl;
+               << "failed to decode client data: " << err.what() << dendl;
     return -EINVAL;
   }
 
@@ -1644,16 +1683,16 @@ int Journal<I>::check_resync_requested(bool *do_resync) {
 }
 
 struct C_RefreshTags : public Context {
-  util::AsyncOpTracker &async_op_tracker;
+  AsyncOpTracker &async_op_tracker;
   Context *on_finish = nullptr;
 
-  Mutex lock;
+  ceph::mutex lock =
+    ceph::make_mutex("librbd::Journal::C_RefreshTags::lock");
   uint64_t tag_tid = 0;
   journal::TagData tag_data;
 
-  explicit C_RefreshTags(util::AsyncOpTracker &async_op_tracker)
-    : async_op_tracker(async_op_tracker),
-      lock("librbd::Journal::C_RefreshTags::lock") {
+  explicit C_RefreshTags(AsyncOpTracker &async_op_tracker)
+    : async_op_tracker(async_op_tracker) {
     async_op_tracker.start_op();
   }
   ~C_RefreshTags() override {
@@ -1668,7 +1707,7 @@ struct C_RefreshTags : public Context {
 template <typename I>
 void Journal<I>::handle_metadata_updated() {
   CephContext *cct = m_image_ctx.cct;
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
 
   if (m_state != STATE_READY && !is_journal_replaying(m_lock)) {
     return;
@@ -1687,7 +1726,7 @@ void Journal<I>::handle_metadata_updated() {
   // pull the most recent tags from the journal, decode, and
   // update the internal tag state
   C_RefreshTags *refresh_ctx = new C_RefreshTags(m_async_journal_op_tracker);
-  refresh_ctx->on_finish = new FunctionContext(
+  refresh_ctx->on_finish = new LambdaContext(
     [this, refresh_sequence, refresh_ctx](int r) {
       handle_refresh_metadata(refresh_sequence, refresh_ctx->tag_tid,
                               refresh_ctx->tag_data, r);
@@ -1704,7 +1743,7 @@ void Journal<I>::handle_refresh_metadata(uint64_t refresh_sequence,
                                          uint64_t tag_tid,
                                          journal::TagData tag_data, int r) {
   CephContext *cct = m_image_ctx.cct;
-  Mutex::Locker locker(m_lock);
+  std::unique_lock locker{m_lock};
 
   if (r < 0) {
     lderr(cct) << this << " " << __func__ << ": failed to refresh metadata: "
@@ -1721,9 +1760,7 @@ void Journal<I>::handle_refresh_metadata(uint64_t refresh_sequence,
                  << "refresh_sequence=" << refresh_sequence << ", "
                  << "tag_tid=" << tag_tid << ", "
                  << "tag_data=" << tag_data << dendl;
-  while (m_listener_notify) {
-    m_listener_cond.Wait(m_lock);
-  }
+  m_listener_cond.wait(locker, [this] { return !m_listener_notify; });
 
   bool was_tag_owner = is_tag_owner(m_lock);
   if (m_tag_tid < tag_tid) {
@@ -1742,7 +1779,7 @@ void Journal<I>::handle_refresh_metadata(uint64_t refresh_sequence,
 
   Listeners listeners(m_listeners);
   m_listener_notify = true;
-  m_lock.Unlock();
+  locker.unlock();
 
   if (promoted_to_primary) {
     for (auto listener : listeners) {
@@ -1754,23 +1791,21 @@ void Journal<I>::handle_refresh_metadata(uint64_t refresh_sequence,
     }
   }
 
-  m_lock.Lock();
+  locker.lock();
   m_listener_notify = false;
-  m_listener_cond.Signal();
+  m_listener_cond.notify_all();
 }
 
 template <typename I>
 void Journal<I>::add_listener(journal::Listener *listener) {
-  Mutex::Locker locker(m_lock);
+  std::lock_guard locker{m_lock};
   m_listeners.insert(listener);
 }
 
 template <typename I>
 void Journal<I>::remove_listener(journal::Listener *listener) {
-  Mutex::Locker locker(m_lock);
-  while (m_listener_notify) {
-    m_listener_cond.Wait(m_lock);
-  }
+  std::unique_lock locker{m_lock};
+  m_listener_cond.wait(locker, [this] { return !m_listener_notify; });
   m_listeners.erase(listener);
 }
 

@@ -5,13 +5,17 @@ import unittest
 
 import cherrypy
 from cherrypy.lib.sessions import RamSession
-from mock import patch
+try:
+    from mock import patch
+except ImportError:
+    from unittest.mock import patch
 
 from . import ControllerTestCase
 from ..services.exception import handle_rados_error
 from ..controllers import RESTController, ApiController, Controller, \
                           BaseController, Proxy
-from ..tools import dict_contains_path, json_str_to_object, partial_dict, RequestLoggingTool
+from ..tools import dict_contains_path, json_str_to_object, partial_dict,\
+                    dict_get, RequestLoggingTool
 
 
 # pylint: disable=W0613
@@ -110,11 +114,10 @@ class RESTControllerTest(ControllerTestCase):
     def test_not_implemented(self):
         self._put("/foo")
         self.assertStatus(404)
-        body = self.jsonBody()
+        body = self.json_body()
         self.assertIsInstance(body, dict)
         assert body['detail'] == "The path '/foo' was not found."
         assert '404' in body['status']
-        assert 'traceback' in body
 
     def test_args_from_json(self):
         self._put("/api/fooargs/hello", {'name': 'world'})
@@ -194,3 +197,8 @@ class TestFunctions(unittest.TestCase):
         self.assertRaises(KeyError, partial_dict, {'a': 1, 'b': 2, 'c': 3}, ['d'])
         self.assertRaises(TypeError, partial_dict, None, ['a'])
         self.assertRaises(TypeError, partial_dict, {'a': 1, 'b': 2, 'c': 3}, None)
+
+    def test_dict_get(self):
+        self.assertFalse(dict_get({'foo': {'bar': False}}, 'foo.bar'))
+        self.assertIsNone(dict_get({'foo': {'bar': False}}, 'foo.bar.baz'))
+        self.assertEqual(dict_get({'foo': {'bar': False}, 'baz': 'xyz'}, 'baz'), 'xyz')

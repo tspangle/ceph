@@ -12,6 +12,7 @@ from ..services.ceph_service import CephService
 from ..services.iscsi_cli import IscsiGatewaysConfig
 from ..services.iscsi_client import IscsiClient
 from ..tools import partial_dict
+from .host import get_hosts
 
 
 class HealthData(object):
@@ -105,7 +106,6 @@ class HealthData(object):
         fs_map = mgr.get('fs_map')
         if self._minimal:
             fs_map = partial_dict(fs_map, ['filesystems', 'standbys'])
-            fs_map['standbys'] = [{}] * len(fs_map['standbys'])
             fs_map['filesystems'] = [partial_dict(item, ['mdsmap']) for
                                      item in fs_map['filesystems']]
             for fs in fs_map['filesystems']:
@@ -113,11 +113,10 @@ class HealthData(object):
                 min_mdsmap_info = dict()
                 for k, v in mdsmap_info.items():
                     min_mdsmap_info[k] = partial_dict(v, ['state'])
-                fs['mdsmap'] = dict(info=min_mdsmap_info)
         return fs_map
 
     def host_count(self):
-        return len(mgr.list_servers())
+        return len(get_hosts())
 
     def iscsi_daemons(self):
         up_counter = 0
@@ -134,7 +133,6 @@ class HealthData(object):
         mgr_map = mgr.get('mgr_map')
         if self._minimal:
             mgr_map = partial_dict(mgr_map, ['active_name', 'standbys'])
-            mgr_map['standbys'] = [{}] * len(mgr_map['standbys'])
         return mgr_map
 
     def mon_status(self):

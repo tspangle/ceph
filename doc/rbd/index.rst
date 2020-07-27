@@ -17,7 +17,9 @@ such as snapshotting, replication and consistency. Ceph's
 :abbr:`RADOS (Reliable Autonomic Distributed Object Store)` Block Devices (RBD)
 interact with OSDs using kernel modules or the ``librbd`` library.
 
-.. ditaa::  +------------------------+ +------------------------+
+.. ditaa::
+
+            +------------------------+ +------------------------+
             |     Kernel Module      | |        librbd          |
             +------------------------+-+------------------------+
             |                   RADOS Protocol                  |
@@ -33,7 +35,7 @@ Ceph's block devices deliver high performance with infinite scalability to
 cloud-based computing systems like `OpenStack`_ and `CloudStack`_ that rely on
 libvirt and QEMU to integrate with Ceph block devices. You can use the same cluster
 to operate the :ref:`Ceph RADOS Gateway <object-gateway>`, the
-:ref:`CephFS filesystem <ceph-filesystem>`, and Ceph block devices simultaneously.
+:ref:`Ceph File System <ceph-file-system>`, and Ceph block devices simultaneously.
 
 .. important:: To use Ceph Block Devices, you must have access to a running
    Ceph cluster.
